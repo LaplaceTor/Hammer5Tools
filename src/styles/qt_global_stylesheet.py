@@ -1,3 +1,39 @@
+# The shared group-box look: a single rule above the title, no box around the
+# content. Its own constant because src/styles/common.py also applies it to
+# widgets one by one (apply_stylesheets), and the two copies drifted apart once
+# — forms using apply_stylesheets drew a full bordered box while everything
+# under the global sheet drew the top rule.
+QSS_GROUPBOX = """
+QGroupBox {
+    border: 1px solid #505050;
+    border-bottom: none;
+    border-left: none;
+    border-right: none;
+    margin-top: 8px;
+	padding-top: 8px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 6;
+    color: white;
+}
+
+QGroupBox::indicator {
+    width: 13px;
+    height: 13px;
+}
+
+QGroupBox::indicator:checked {
+    image: url(://icons/arrow_drop_down.png);
+}
+
+QGroupBox::indicator:unchecked {
+    image: url(://icons/arrow_drop_right.png);
+}
+"""
+
 QT_Stylesheet_global = """
 /* # background_neutral 151515
 # background_Primary 1C1C1C
@@ -20,36 +56,7 @@ QLabel {
 
 
 /* ========================================================== */
-
-QGroupBox {
-    border: 1px solid #505050;
-    border-bottom: none;
-    border-left: none;
-    border-right: none;
-    margin-top: 8px;
-	padding-top: 8px;
-}
-
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    padding: 0 6;
-    color: white; 
-}
-
-QGroupBox::indicator {
-    width: 13px;
-    height: 13px;
-}
-
-QGroupBox::indicator:checked {
-    image: url(://icons/arrow_drop_down.png); 
-}
-
-QGroupBox::indicator:unchecked {
-    image: url(://icons/arrow_drop_right.png);
-}
-
+""" + QSS_GROUPBOX + """
 /* ========================================================== */
     QPushButton {
 
@@ -783,6 +790,16 @@ QWidget {
     outline: none;
 }
 
+/* Opt-out for children that must not hide a parent's custom painting.
+   The blanket rule above gives every widget in the application an opaque
+   background, so a widget that draws in its paintEvent has its work covered up
+   by its own children. Those children are marked with
+   styles.common.mark_paint_through(). The attribute selector outranks the
+   plain type selector above, so this wins without changing anything else. */
+QWidget[paintThrough="true"] {
+    background: transparent;
+}
+
 QWidget:item:checked {
     background-color: #151515;
     color: white;
@@ -897,9 +914,9 @@ QMenuBar::item:disabled {
 QScrollBar:horizontal
 {
     height: 15px;
-    margin: 3px 15px 3px 15px;
+    margin: 3px 3px 3px 3px;
     border: 1px transparent #2A2929;
-    border-radius: 4px;
+    border-radius: 0px;
     background-color: #2A2929;
 }
 
@@ -907,50 +924,19 @@ QScrollBar::handle:horizontal
 {
     background-color: #414956;
     min-width: 5px;
-    border-radius: 4px;
+    border-radius: 0px;
 }
 
-QScrollBar::add-line:horizontal
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal
 {
-    margin: 0px 3px 0px 3px;
-    border-image: url(:/qss_icons/rc/right_arrow_disabled.png);
-    width: 10px;
-    height: 10px;
-    subcontrol-position: right;
-    subcontrol-origin: margin;
-}
-
-QScrollBar::sub-line:horizontal
-{
-    margin: 0px 3px 0px 3px;
-    border-image: url(:/qss_icons/rc/left_arrow_disabled.png);
-    height: 10px;
-    width: 10px;
-    subcontrol-position: left;
-    subcontrol-origin: margin;
-}
-
-QScrollBar::add-line:horizontal:hover,QScrollBar::add-line:horizontal:on
-{
-    border-image: url(:/qss_icons/rc/right_arrow.png);
-    height: 10px;
-    width: 10px;
-    subcontrol-position: right;
-    subcontrol-origin: margin;
-}
-
-
-QScrollBar::sub-line:horizontal:hover, QScrollBar::sub-line:horizontal:on
-{
-    border-image: url(:/qss_icons/rc/left_arrow.png);
-    height: 10px;
-    width: 10px;
-    subcontrol-position: left;
-    subcontrol-origin: margin;
+    width: 0px;
+    height: 0px;
 }
 
 QScrollBar::up-arrow:horizontal, QScrollBar::down-arrow:horizontal
 {
+    width: 0px;
+    height: 0px;
     background: none;
 }
 
@@ -966,58 +952,28 @@ QScrollBar:vertical
 {
     background-color: #2A2929;
     width: 15px;
-    margin: 15px 3px 15px 3px;
+    margin: 3px 3px 3px 3px;
     border: 1px transparent #2A2929;
-    border-radius: 4px;
+    border-radius: 0px;
 }
 
 QScrollBar::handle:vertical
 {
     background-color: #414956;         /* #605F5F; */
     min-height: 5px;
-    border-radius: 4px;
-}
-    /* Vertical */
-QScrollBar::sub-line:vertical
-{
-    margin: 3px 0px 3px 0px;
-    border-image: url(:/qss_icons/rc/up_arrow_disabled.png);
-    height: 10px;
-    width: 10px;
-    subcontrol-position: top;
-    subcontrol-origin: margin;
+    border-radius: 0px;
 }
 
-QScrollBar::add-line:vertical
+QScrollBar::sub-line:vertical, QScrollBar::add-line:vertical
 {
-    margin: 3px 0px 3px 0px;
-    border-image: url(:/qss_icons/rc/down_arrow_disabled.png);
-    height: 10px;
-    width: 10px;
-    subcontrol-position: bottom;
-    subcontrol-origin: margin;
-}
-
-QScrollBar::sub-line:vertical:hover,QScrollBar::sub-line:vertical:on
-{
-    border-image: url(:/qss_icons/rc/up_arrow.png);
-    height: 10px;
-    width: 10px;
-    subcontrol-position: top;
-    subcontrol-origin: margin;
-}
-
-QScrollBar::add-line:vertical:hover, QScrollBar::add-line:vertical:on
-{
-    border-image: url(:/qss_icons/rc/down_arrow.png);
-    height: 10px;
-    width: 10px;
-    subcontrol-position: bottom;
-    subcontrol-origin: margin;
+    height: 0px;
+    width: 0px;
 }
 
 QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical
 {
+    height: 0px;
+    width: 0px;
     background: none;
 }
 

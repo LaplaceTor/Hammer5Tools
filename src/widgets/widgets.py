@@ -617,7 +617,7 @@ class ComboboxTreeChild(ComboboxDynamicItems):
 
         return data_out
 
-def make_composite_icon(base_icon, item_data, overlay_path=r"D:\CG\Projects\Other\Hammer5Tools\src\icons\tools\pet\func_constraint.png", size: int = 18):
+def make_composite_icon(base_icon, item_data, overlay_path=None, size: int = 18):
     if base_icon is None or base_icon.isNull():
         return base_icon
     if not isinstance(item_data, dict):
@@ -666,15 +666,66 @@ def make_composite_icon(base_icon, item_data, overlay_path=r"D:\CG\Projects\Othe
     res_pixmap = QPixmap.fromImage(image)
 
     if is_expression:
-        overlay_pm = QPixmap(overlay_path)
-        if not overlay_pm.isNull():
-            painter = QPainter(res_pixmap)
-            overlay_size = max(int(icon_size * 0.65), 10)
-            scaled_overlay = overlay_pm.scaled(overlay_size, overlay_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            painter.drawPixmap(icon_size - overlay_size, icon_size - overlay_size, scaled_overlay)
-            painter.end()
+        import os
+        if overlay_path is None or not os.path.exists(str(overlay_path)):
+            default_overlay = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "icons", "tools", "pet", "func_constraint.png")
+            )
+            if os.path.exists(default_overlay):
+                overlay_path = default_overlay
+            else:
+                try:
+                    from src.common import app_dir
+                    cand1 = os.path.normpath(os.path.join(app_dir, "src", "icons", "tools", "pet", "func_constraint.png"))
+                    cand2 = os.path.normpath(os.path.join(app_dir, "icons", "tools", "pet", "func_constraint.png"))
+                    if os.path.exists(cand1):
+                        overlay_path = cand1
+                    elif os.path.exists(cand2):
+                        overlay_path = cand2
+                except Exception:
+                    pass
+
+        if overlay_path and os.path.exists(str(overlay_path)):
+            overlay_pm = QPixmap(str(overlay_path))
+            if not overlay_pm.isNull():
+                painter = QPainter(res_pixmap)
+                overlay_size = max(int(icon_size * 0.65), 10)
+                scaled_overlay = overlay_pm.scaled(overlay_size, overlay_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                painter.drawPixmap(icon_size - overlay_size, icon_size - overlay_size, scaled_overlay)
+                painter.end()
 
     return QIcon(res_pixmap)
+
+
+#: Element classes that are leaf-only in the CS2 SmartProp format — m_Children must stay empty.
+NO_CHILDREN_CLASSES = ("Model", "SmartProp", "ModifyState", "PropPhysics", "PropDynamic")
+
+
+def add_error_badge(icon, size: int = 18):
+    """Overlay a small error badge on the bottom-right corner of ``icon``."""
+    if icon is None or icon.isNull():
+        return icon
+    from PySide6.QtGui import QPixmap, QPainter, QIcon
+    from PySide6.QtCore import QSize
+
+    sizes = icon.availableSizes()
+    size_obj = sizes[0] if sizes else QSize(size, size)
+    icon_size = max(size_obj.width(), size_obj.height(), size)
+
+    pixmap = icon.pixmap(icon_size, icon_size)
+    if pixmap.isNull():
+        return icon
+    overlay_pm = QPixmap(":/icons/tools/common/icon_error_sm.png")
+    if overlay_pm.isNull():
+        return icon
+
+    result = QPixmap(pixmap)
+    painter = QPainter(result)
+    overlay_size = max(int(icon_size * 0.65), 10)
+    scaled = overlay_pm.scaled(overlay_size, overlay_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    painter.drawPixmap(icon_size - overlay_size, icon_size - overlay_size, scaled)
+    painter.end()
+    return QIcon(result)
 
 
 class HierarchyItemModel(QTreeWidgetItem):
@@ -698,6 +749,7 @@ class HierarchyItemModel(QTreeWidgetItem):
                 self.seticon_vsmart()
             else:
                 self.seticon_generic()
+            self._apply_child_lock_flag(_class)
         if self.show_id:
             if _id is not None:
                 self.setText(3, str(_id))
@@ -734,6 +786,23 @@ class HierarchyItemModel(QTreeWidgetItem):
                 self.seticon_vsmart()
             else:
                 self.seticon_generic()
+            self._apply_child_lock_flag(_class)
+
+    def _apply_child_lock_flag(self, _class):
+        """Model/SmartProp elements are leaf-only — refuse drops that would parent onto them.
+
+        Above/below drops (reordering as a sibling) are unaffected since those target this
+        item's parent, not this item.
+        """
+        if _class in NO_CHILDREN_CLASSES:
+            self.setFlags(self.flags() & ~Qt.ItemIsDropEnabled)
+        else:
+            self.setFlags(self.flags() | Qt.ItemIsDropEnabled)
+
+    def violates_child_lock(self):
+        """True if this is a Model/SmartProp element that already has children (soft-lock,
+        not enforced retroactively — e.g. loaded from a file authored outside this tool)."""
+        return self.text(2) in NO_CHILDREN_CLASSES and self.childCount() > 0
 
 
     def _get_gray_icon(self, icon):
@@ -784,8 +853,13 @@ class HierarchyItemModel(QTreeWidgetItem):
         if role == Qt.DecorationRole and column == 0:
             normal_icon = super().data(0, Qt.DecorationRole)
             if normal_icon is not None and isinstance(item_data, dict):
-                return make_composite_icon(normal_icon, item_data)
+                normal_icon = make_composite_icon(normal_icon, item_data)
+            if normal_icon is not None and self.violates_child_lock():
+                normal_icon = add_error_badge(normal_icon)
             return normal_icon
+
+        if role == Qt.ToolTipRole and column == 0 and self.violates_child_lock():
+            return "Models and Smartprop elements cannot have any child elements."
 
         if role == Qt.BackgroundRole and column in self.background_colors:
             return self.background_colors[column]

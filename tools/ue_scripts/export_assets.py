@@ -17,17 +17,68 @@ H5T_UE_CONTENT_PATH / H5T_UE_OUTPUT_DIR env vars instead of call arguments:
 
 Point Hammer5Tools' Unreal Converter "UE Export cache folder" field at the
 same output_dir afterwards (see src/forms/unreal_converter/main.py).
+
+Meshes export with FbxExportOption.force_front_x_axis so the FBX declares +X as
+its front axis instead of UE's default -Y, matching Source 2's forward vector.
 """
 
 import os
 
 _EXPORTABLE_CLASSES = ("StaticMesh", "Texture2D")
 
+# Maps routinely place engine content that lives outside /Game — the default
+# template floor (/Engine/MapTemplates/SM_Template_Map_Floor) is in every map
+# made from a UE template, and BasicShapes are common greyboxing props. Without
+# these roots the converter writes a vmdl pointing at a mesh nobody exported.
+# /Engine as a whole is thousands of assets, so only the roots that actually
+# get placed in levels are included.
+DEFAULT_CONTENT_PATHS = "/Game;/Engine/MapTemplates;/Engine/BasicShapes"
 
-def _select_export_paths(asset_infos, classes=_EXPORTABLE_CLASSES):
+
+def _split_paths(content_path: str) -> list:
+    """'/Game;/Engine/MapTemplates' -> ['/Game', '/Engine/MapTemplates'].
+    Accepts ';' or ',' so the env var is forgiving about separators."""
+    if not content_path:
+        return []
+    parts = content_path.replace(",", ";").split(";")
+    seen, out = set(), []
+    for p in parts:
+        p = p.strip().rstrip("/")
+        if p and p.lower() not in seen:
+            seen.add(p.lower())
+            out.append(p)
+    return out
+
+
+def _asset_stem(path: str) -> str:
+    """'/Game/Meshes/SM_Chair.SM_Chair' or 'Meshes/SM_Chair.uasset' -> 'sm_chair'"""
+    filename = os.path.basename(path).replace("\\", "/")
+    return filename.split(".", 1)[0].lower()
+
+
+def _select_export_paths(asset_infos, classes=_EXPORTABLE_CLASSES, asset_filter=None):
     """asset_infos: iterable of (object_path, class_name). Returns the object
-    paths whose class is exportable — split out so it's testable without the
-    `unreal` module, which only exists inside the Editor process."""
+    paths whose class is exportable. If asset_filter set is provided, only
+    returns paths whose lowercased stem or object path matches the filter.
+
+    The filter comes from the user's port scope, which is a listing of the
+    *project* — engine content can never appear in it. So engine roots are
+    exempt from it; they are a couple of dozen assets in total, and filtering
+    them is indistinguishable from not exporting them at all."""
+    if asset_filter:
+        allowed = {str(item).replace("\\", "/").lower() for item in asset_filter if item}
+        allowed_stems = {_asset_stem(item) for item in allowed}
+        res = []
+        for path, cls in asset_infos:
+            if cls not in classes:
+                continue
+            path_low = path.replace("\\", "/").lower()
+            stem_low = _asset_stem(path)
+            if (not path_low.startswith("/game/")
+                    or stem_low in allowed_stems or path_low in allowed
+                    or any(path_low.endswith(x) for x in allowed)):
+                res.append(path)
+        return res
     return [path for path, cls in asset_infos if cls in classes]
 
 
@@ -55,48 +106,133 @@ def _get_asset_object_path(data) -> str:
 
 def _list_assets(unreal, content_path: str):
     """Yields (object_path, class_name) for assets under content_path.
-    Tries EditorAssetLibrary first, falling back to AssetRegistryHelpers."""
-    # Method 1: EditorAssetLibrary (requires EditorScriptingUtilities plugin)
-    if hasattr(unreal, "EditorAssetLibrary"):
-        try:
-            for object_path in unreal.EditorAssetLibrary.list_assets(content_path, recursive=True, include_folder=False):
-                data = unreal.EditorAssetLibrary.find_asset_data(object_path)
-                if data:
-                    yield (str(object_path), _get_asset_class_name(data))
-            return
-        except Exception as e:
-            if hasattr(unreal, "log_warning"):
-                unreal.log_warning(f"EditorAssetLibrary failed ({e}), falling back to AssetRegistryHelpers")
 
-    # Method 2: AssetRegistryHelpers (built-in to PythonScriptPlugin in UE4/UE5)
-    if hasattr(unreal, "AssetRegistryHelpers"):
-        registry = unreal.AssetRegistryHelpers.get_asset_registry()
-        assets = registry.get_assets_by_path(content_path, recursive=True)
-        for data in assets:
-            obj_path = _get_asset_object_path(data)
-            cls_name = _get_asset_class_name(data)
-            if obj_path and cls_name:
-                yield (obj_path, cls_name)
-        return
+    The scan is not optional. A commandlet's asset registry comes up holding
+    /Game and the handful of engine folders the editor always scans (BasicShapes
+    is one, MapTemplates is not), so listing /Engine/MapTemplates without asking
+    for it first returns zero assets and the map's template floor silently never
+    exports. scan_paths_synchronous is a no-op for a path already scanned.
+    """
+    if not hasattr(unreal, "AssetRegistryHelpers"):
+        raise RuntimeError("AssetRegistryHelpers is not available in Unreal Python.")
 
-    raise RuntimeError("Neither EditorAssetLibrary nor AssetRegistryHelpers is available in Unreal Python.")
+    registry = unreal.AssetRegistryHelpers.get_asset_registry()
+    registry.scan_paths_synchronous([content_path], force_rescan=True)
+    for data in registry.get_assets_by_path(content_path, recursive=True):
+        obj_path = _get_asset_object_path(data)
+        cls_name = _get_asset_class_name(data)
+        if obj_path and cls_name:
+            yield (obj_path, cls_name)
 
 
-def run(content_path: str = "/Game", output_dir: str = None):
+def _export_filename(object_path: str, output_dir: str, ext: str = ".fbx") -> str:
+    """'/Game/Meshes/SM_Chair.SM_Chair' -> '<output_dir>/Game/Meshes/SM_Chair.fbx'.
+
+    Reproduces the layout AssetTools.export_assets writes, which the converter's
+    cache scan depends on (ENGINE_EXPORT_ROOTS in src/forms/unreal_porter/main.py
+    looks for '<cache>/Engine/BasicShapes' by name)."""
+    package = object_path.rsplit(".", 1)[0]
+    return os.path.join(output_dir, package.lstrip("/").replace("/", os.sep)) + ext
+
+
+def _export_assets(unreal, export_paths, output_dir) -> int:
+    """Export every path, returning how many succeeded.
+
+    StaticMeshes and Texture2Ds go one at a time through AssetExportTask so that
+    (1) meshes use FbxExportOption.force_front_x_axis for Source 2 forward alignment, and
+    (2) textures export reliably in headless / commandlet mode without requiring GUI interaction.
+    """
+    meshes, textures, others = [], [], []
+    has_tasks = hasattr(unreal, "AssetExportTask")
+
+    for path in export_paths:
+        asset = unreal.load_asset(path) if has_tasks else None
+        if asset is not None:
+            if isinstance(asset, unreal.StaticMesh):
+                meshes.append((path, asset))
+                continue
+            elif isinstance(asset, unreal.Texture2D):
+                textures.append((path, asset))
+                continue
+        others.append(path)
+
+    if has_tasks and not hasattr(unreal, "FbxExportOption"):
+        unreal.log_warning(
+            "This Unreal build has no FbxExportOption — meshes export with UE's default "
+            "-Y front axis and will come into Hammer yawed 90 degrees."
+        )
+
+    exported = 0
+    if meshes:
+        options = unreal.FbxExportOption() if hasattr(unreal, "FbxExportOption") else None
+        if options:
+            options.set_editor_property("force_front_x_axis", True)
+        for path, asset in meshes:
+            filename = _export_filename(path, output_dir, ext=".fbx")
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            task = unreal.AssetExportTask()
+            task.set_editor_property("object", asset)
+            task.set_editor_property("filename", filename)
+            task.set_editor_property("automated", True)
+            task.set_editor_property("prompt", False)
+            task.set_editor_property("replace_identical", True)
+            if options:
+                task.set_editor_property("options", options)
+            if unreal.Exporter.run_asset_export_task(task):
+                exported += 1
+            else:
+                unreal.log_warning(f"Export failed for mesh {path}")
+
+    if textures:
+        for path, asset in textures:
+            filename = _export_filename(path, output_dir, ext=".tga")
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            task = unreal.AssetExportTask()
+            task.set_editor_property("object", asset)
+            task.set_editor_property("filename", filename)
+            task.set_editor_property("automated", True)
+            task.set_editor_property("prompt", False)
+            task.set_editor_property("replace_identical", True)
+            if unreal.Exporter.run_asset_export_task(task):
+                exported += 1
+            else:
+                unreal.log_warning(f"Export failed for texture {path}")
+
+    if others:
+        unreal.AssetToolsHelpers.get_asset_tools().export_assets(others, output_dir)
+        exported += len(others)
+    return exported
+
+
+def run(content_path: str = DEFAULT_CONTENT_PATHS, output_dir: str = None):
+    """content_path may name several roots, ';'-separated — see
+    DEFAULT_CONTENT_PATHS. Roots that don't exist in this project are skipped
+    with a warning rather than failing the whole export."""
     if not output_dir:
         raise ValueError("output_dir is required")
     import unreal  # only importable inside the UE Editor process
 
-    infos = list(_list_assets(unreal, content_path))
+    infos = []
+    for root in _split_paths(content_path):
+        try:
+            found = list(_list_assets(unreal, root))
+        except Exception as e:
+            unreal.log_warning(f"Skipping content path {root}: {e}")
+            continue
+        if not found:
+            unreal.log_warning(f"No assets found under {root}")
+        infos.extend(found)
 
-    export_paths = _select_export_paths(infos)
+    asset_list_raw = os.environ.get("H5T_UE_ASSET_LIST")
+    asset_filter = set(asset_list_raw.replace(",", ";").split(";")) if asset_list_raw else None
+
+    export_paths = _select_export_paths(infos, asset_filter=asset_filter)
     if not export_paths:
-        unreal.log_warning(f"No StaticMesh/Texture2D assets found under {content_path}")
+        unreal.log_warning(f"No StaticMesh/Texture2D assets found matching criteria under {content_path}")
         return
 
-    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-    asset_tools.export_assets(export_paths, output_dir)
-    unreal.log(f"Exported {len(export_paths)} asset(s) to {output_dir}")
+    ok = _export_assets(unreal, export_paths, output_dir)
+    unreal.log(f"Exported {ok}/{len(export_paths)} asset(s) to {output_dir}")
 
 
 class DummyAssetDataUE4:
@@ -130,6 +266,39 @@ def demo():
         ("/Game/B", "Texture2D"),
         ("/Game/C", "MaterialInstanceConstant"),
     ]) == ["/Game/A", "/Game/B"]
+
+    # A port scope narrows /Game but must never narrow engine content: the scope
+    # is a listing of the project, so no engine asset can ever match it.
+    scoped = _select_export_paths([
+        ("/Game/Meshes/SM_Chair.SM_Chair", "StaticMesh"),
+        ("/Game/Meshes/SM_Table.SM_Table", "StaticMesh"),
+        ("/Engine/MapTemplates/SM_Template_Map_Floor.SM_Template_Map_Floor", "StaticMesh"),
+        ("/Engine/BasicShapes/Cube.Cube", "StaticMesh"),
+        ("/Engine/MapTemplates/M_Thing.M_Thing", "MaterialInstanceConstant"),
+    ], asset_filter={"P/Content/Meshes/SM_Chair.uasset"})
+    assert scoped == [
+        "/Game/Meshes/SM_Chair.SM_Chair",
+        "/Engine/MapTemplates/SM_Template_Map_Floor.SM_Template_Map_Floor",
+        "/Engine/BasicShapes/Cube.Cube",
+    ], scoped
+
+    assert _split_paths("/Game") == ["/Game"]
+    assert _split_paths(DEFAULT_CONTENT_PATHS) == [
+        "/Game", "/Engine/MapTemplates", "/Engine/BasicShapes"]
+    # Engine content must survive: a map built from a UE template places
+    # /Engine/MapTemplates/SM_Template_Map_Floor and nothing else exports it.
+    assert "/Engine/MapTemplates" in _split_paths(DEFAULT_CONTENT_PATHS)
+    assert _split_paths("/Game, /Engine/MapTemplates/") == ["/Game", "/Engine/MapTemplates"]
+    assert _split_paths("/Game;/game") == ["/Game"], "duplicate roots collapse"
+    assert _split_paths("") == []
+
+    # The export path has to land where the converter's cache scan looks —
+    # '<cache>/Engine/BasicShapes' is matched by directory name, not by search.
+    out = os.path.join("D:", os.sep, "cache")
+    assert _export_filename("/Game/Meshes/SM_Chair.SM_Chair", out) == os.path.join(
+        out, "Game", "Meshes", "SM_Chair.fbx")
+    assert _export_filename("/Engine/BasicShapes/Cube.Cube", out) == os.path.join(
+        out, "Engine", "BasicShapes", "Cube.fbx")
     print("ok")
 
 
@@ -143,4 +312,5 @@ if __name__ == "__main__":
     except ImportError:
         demo()
     else:
-        run(os.environ.get("H5T_UE_CONTENT_PATH", "/Game"), os.environ.get("H5T_UE_OUTPUT_DIR"))
+        run(os.environ.get("H5T_UE_CONTENT_PATH") or DEFAULT_CONTENT_PATHS,
+            os.environ.get("H5T_UE_OUTPUT_DIR"))

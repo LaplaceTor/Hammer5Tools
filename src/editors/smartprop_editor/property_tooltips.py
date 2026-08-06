@@ -171,6 +171,7 @@ property_tooltips = {
     "m_nNthPositionIndexOffset": "Specifies an offset to use when determining the Nth position to place an element at. For example if placing at every third position with an offset of 0, an element will appear at positions 1, 4, 7, and so on. But if an offset of 2 is set instead of 0, then an element will appear at positions 3, 6, and 9 and so on.",
     "m_nPickMode": "Specifies how scale is applied to each of the selected element in order to fit them to the line.",
     "m_nPlaceEveryNthPosition": "Specifies the spacing between positions. For example, a value of 1 will place the element at very position, 2 every other position, 3 every third position",
+    "m_nReferenceID": "This property can be used only in Hammer5Tools for elements. This property is used to copy modifiers and properties from the selected element, respecting overrides. Important: it cannot be visible in the viewport — you have to save the file.",
     "m_nScaleMode": "Specifies how scale is applied to each of the selected element in order to fit them to the line.",
     "m_nTargetOpenEdgeCount": "Iterate through faces with 'n' open edges (edges with only one neighboring face).",
     "m_nTargetVertexCount": "Iterate through faces with target vertex count.",
@@ -234,15 +235,15 @@ property_tooltips = {
     "Element_MidpointDeformer": "Soft deform the center of a volume defined by two endpoints.",
     "CSmartPropElement_Model": {
         "description": "Places a model as the child of an element.",
-        "image": r"D:\CG\Projects\Other\Hammer5Tools\src\images\help\img_placeholder.png",
+        "image": r"src/images/help/img_placeholder.png",
     },
     "Model": {
         "description": "Places a model as the child of an element.",
-        "image": r"D:\CG\Projects\Other\Hammer5Tools\src\images\help\img_placeholder.png",
+        "image": r"src/images/help/img_placeholder.png",
     },
     "Element_Model": {
         "description": "Places a model as the child of an element.",
-        "image": r"D:\CG\Projects\Other\Hammer5Tools\src\images\help\img_placeholder.png",
+        "image": r"src/images/help/img_placeholder.png",
     },
     "CSmartPropElement_ModifyState": "An element which is used to apply a set of modifiers to the state of its parent.",
     "ModifyState": "An element which is used to apply a set of modifiers to the state of its parent.",
@@ -528,14 +529,25 @@ def resolve_image_path(path_str: str | None) -> str | None:
         return path_str
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-    candidate1 = os.path.join(base_dir, path_str)
+    candidate1 = os.path.normpath(os.path.join(base_dir, path_str))
     if os.path.exists(candidate1):
         return candidate1
 
     src_dir = os.path.join(base_dir, "src")
-    candidate2 = os.path.join(src_dir, path_str)
+    candidate2 = os.path.normpath(os.path.join(src_dir, path_str))
     if os.path.exists(candidate2):
         return candidate2
+
+    try:
+        from src.common import app_dir
+        cand3 = os.path.normpath(os.path.join(app_dir, path_str))
+        if os.path.exists(cand3):
+            return cand3
+        cand4 = os.path.normpath(os.path.join(app_dir, "src", path_str))
+        if os.path.exists(cand4):
+            return cand4
+    except Exception:
+        pass
 
     return None
 

@@ -3,6 +3,7 @@ using CUE4Parse.FileProvider;
 using CUE4Parse.UE4.Assets.Exports.Actor;
 using CUE4Parse.UE4.Assets.Exports.Component.Landscape;
 using CUE4Parse.UE4.Assets.Objects;
+using CUE4Parse.UE4.Assets.Objects.Properties;
 using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Versions;
@@ -17,6 +18,7 @@ using Newtonsoft.Json;
 //   info <projectContentDir>
 //   list <projectContentDir> <substring>
 //   dump <projectContentDir> <objectPath>        (raw JSON of all exports)
+//   iter-refs <projectContentDir> <objectPath>   (flat list of referenced object paths)
 //   dump-scene <projectContentDir> <mapPath>      (normalized actor list)
 
 static class Program
@@ -54,6 +56,7 @@ static class Program
                 case "info": return Info(provider, dir);
                 case "list": return List(provider, args.Length > 2 ? args[2] : "");
                 case "dump": return Dump(provider, args[2]);
+                case "iter-refs": return IterRefs(provider, args[2]);
                 case "dump-scene": return DumpScene(provider, args[2]);
                 case "dump-blueprint": return DumpBlueprint(provider, args[2]);
                 case "dump-material": return DumpMaterial(provider, args[2]);
@@ -91,12 +94,16 @@ static class Program
         return 0;
     }
 
+    // No cap. This is the converter's whole view of a project: the port scope,
+    // the material scan and reference expansion are all built from it, so a
+    // truncated list does not shrink the port, it silently drops every asset
+    // past the cut (a 563-asset project ported 52 meshes). A few thousand paths
+    // of JSON over stdout costs nothing next to that.
     static int List(DefaultFileProvider provider, string substring)
     {
         var matches = provider.Files.Keys
             .Where(f => f.Contains(substring, StringComparison.OrdinalIgnoreCase))
             .OrderBy(f => f)
-            .Take(200)
             .ToList();
         Console.WriteLine(JsonConvert.SerializeObject(matches, Formatting.Indented));
         return 0;
@@ -109,6 +116,103 @@ static class Program
         var json = JsonConvert.SerializeObject(exports, Formatting.Indented);
         Console.WriteLine(json);
         return 0;
+    }
+
+    // Collect every asset reference in a package as a flat list of object paths,
+    // WITHOUT serialising the whole export tree. `dump` greps the rendered JSON
+    // for reference fields, which for a StaticMesh means buffering hundreds of
+    // megabytes of RenderData (and the material slots serialise as null when
+    // their FPackageIndex import doesn't resolve). This walks the live objects
+    // and resolves each ref the same way dump-scene/dump-blueprint do.
+    static int IterRefs(DefaultFileProvider provider, string objectPath)
+    {
+        var pkg = provider.LoadPackage(objectPath);
+        var refs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var export in pkg.GetExports())
+        {
+            CollectExportRefs(export, refs);
+        }
+
+        Console.WriteLine(JsonConvert.SerializeObject(refs.OrderBy(r => r).ToList(), Formatting.Indented));
+        return 0;
+    }
+
+    // Walk one export for references. Mesh material arrays are pulled explicitly
+    // (StaticMaterials/SkeletalMaterials hold the slots every other path reads
+    // one at a time); the generic property walk then catches Parent (materials),
+    // StaticMesh (components), textures on material expression nodes, etc.
+    private static void CollectExportRefs(CUE4Parse.UE4.Assets.Exports.UObject export, HashSet<string> refs)
+    {
+        // StaticMesh.StaticMaterials[].MaterialInterface (+ OverlayMaterialInterface)
+        if (export is CUE4Parse.UE4.Assets.Exports.StaticMesh.UStaticMesh sm && sm.StaticMaterials != null)
+        {
+            foreach (var slot in sm.StaticMaterials)
+            {
+                AddRef(refs, slot.MaterialInterface?.GetPathName());
+                AddRef(refs, PkgIndexPath(slot.OverlayMaterialInterface));
+            }
+        }
+        // SkeletalMesh.SkeletalMaterials[].Material (+ OverlayMaterialInterface)
+        if (export is CUE4Parse.UE4.Assets.Exports.SkeletalMesh.USkeletalMesh skm && skm.SkeletalMaterials != null)
+        {
+            foreach (var slot in skm.SkeletalMaterials)
+            {
+                AddRef(refs, slot.Material?.GetPathName());
+                AddRef(refs, PkgIndexPath(slot.OverlayMaterialInterface));
+            }
+        }
+
+        // Generic walk over the export's tagged properties.
+        WalkProperties(export.Properties, refs, 0);
+    }
+
+    // Resolve every FPackageIndex inside a list of FPropertyTag, recursing into
+    // structs and arrays. Mirrors the property access dump-scene does inline.
+    private static void WalkProperties(List<FPropertyTag> properties, HashSet<string> refs, int depth)
+    {
+        if (properties == null || depth > 8) return; // defence against pathological nesting
+        foreach (var tag in properties)
+        {
+            switch (tag.Tag)
+            {
+                case ObjectProperty obj:                 // FPropertyTagType<FPackageIndex>
+                    AddRef(refs, PkgIndexPath(obj.Value));
+                    break;
+                case StructProperty st when st.Value?.StructType is FStructFallback fb:
+                    WalkProperties(fb.Properties, refs, depth + 1);
+                    break;
+                case ArrayProperty arr:                  // FPropertyTagType<UScriptArray>
+                    if (arr.Value != null)
+                    {
+                        foreach (var item in arr.Value.Properties)
+                        {
+                            switch (item)
+                            {
+                                case ObjectProperty o:
+                                    AddRef(refs, PkgIndexPath(o.Value));
+                                    break;
+                                case StructProperty s when s.Value?.StructType is FStructFallback inner:
+                                    WalkProperties(inner.Properties, refs, depth + 1);
+                                    break;
+                            }
+                        }
+                    }
+                    break;
+            }
+        }
+    }
+
+    private static string? PkgIndexPath(FPackageIndex? pi)
+    {
+        // Matches dump-scene/dump-blueprint: resolve through the package.
+        if (pi == null || pi.IsNull) return null;
+        return pi.ResolvedObject?.GetPathName();
+    }
+
+    private static void AddRef(HashSet<string> refs, string? path)
+    {
+        if (!string.IsNullOrEmpty(path)) refs.Add(path);
     }
 
     // Matrix math helpers to accumulate parent-child transforms into world space.
@@ -639,6 +743,17 @@ static class Program
     // Extract a UE Material's OWN instance-level overrides (TextureParameterValues
     // / ScalarParameterValues / VectorParameterValues) from a single export — used
     // at every level while walking a MaterialInstance parent chain.
+    // UE 4.19+ nests a parameter's name inside FMaterialParameterInfo
+    // ("ParameterInfo": { "Name": ... }); assets saved by 4.18 and earlier carry
+    // a flat FName "ParameterName" instead. Reading only the modern shape makes
+    // every override on old content resolve to null, so the instance contributes
+    // nothing and DumpMaterial falls through to the base Material's expression
+    // defaults — which is why whole marketplace packs converted to one flat
+    // placeholder colour.
+    static string? ParamName(FStructFallback p) =>
+        p.GetOrDefault<FStructFallback?>("ParameterInfo", null)?.GetOrDefault<FName?>("Name", null)?.Text
+        ?? p.GetOrDefault<FName?>("ParameterName", null)?.Text;
+
     static void CollectInstanceParams(
         CUE4Parse.UE4.Assets.Exports.UObject export,
         Dictionary<string, string> textures, Dictionary<string, float> scalars, Dictionary<string, object> vectors,
@@ -648,7 +763,7 @@ static class Program
         if (texParams != null)
             foreach (var tp in texParams)
             {
-                var name = tp.GetOrDefault<FStructFallback?>("ParameterInfo", null)?.GetOrDefault<FName?>("Name", null)?.Text;
+                var name = ParamName(tp);
                 var texPath = tp.GetOrDefault<FPackageIndex?>("ParameterValue", null)?.ResolvedObject?.GetPathName();
                 if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(texPath) && !textures.ContainsKey(name))
                     textures[name] = texPath;
@@ -658,7 +773,7 @@ static class Program
         if (scalarParams != null)
             foreach (var sp in scalarParams)
             {
-                var name = sp.GetOrDefault<FStructFallback?>("ParameterInfo", null)?.GetOrDefault<FName?>("Name", null)?.Text;
+                var name = ParamName(sp);
                 if (!string.IsNullOrEmpty(name) && !scalars.ContainsKey(name))
                     scalars[name] = sp.GetOrDefault<float>("ParameterValue", 0f);
             }
@@ -667,7 +782,7 @@ static class Program
         if (vectorParams != null)
             foreach (var vp in vectorParams)
             {
-                var name = vp.GetOrDefault<FStructFallback?>("ParameterInfo", null)?.GetOrDefault<FName?>("Name", null)?.Text;
+                var name = ParamName(vp);
                 var val = vp.GetOrDefault<FLinearColor?>("ParameterValue", null);
                 if (!string.IsNullOrEmpty(name) && val != null && !vectors.ContainsKey(name))
                     vectors[name] = new { r = val.Value.R, g = val.Value.G, b = val.Value.B, a = val.Value.A };
@@ -682,7 +797,7 @@ static class Program
         if (switchParams != null)
             foreach (var swp in switchParams)
             {
-                var name = swp.GetOrDefault<FStructFallback?>("ParameterInfo", null)?.GetOrDefault<FName?>("Name", null)?.Text;
+                var name = ParamName(swp);
                 if (!string.IsNullOrEmpty(name) && !switches.ContainsKey(name))
                     switches[name] = swp.GetOrDefault<bool>("Value", false);
             }

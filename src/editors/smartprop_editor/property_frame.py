@@ -2,7 +2,7 @@ from src.settings.main import debug
 from src.editors.smartprop_editor.ui_property_frame import Ui_Form
 
 from PySide6.QtWidgets import QWidget, QMenu, QApplication
-from PySide6.QtCore import Signal, Qt, QTimer, QThreadPool, QSize
+from PySide6.QtCore import Signal, Qt, QEvent, QTimer, QThreadPool, QSize
 from PySide6.QtGui import QAction
 from src.editors.smartprop_editor.property import compact
 
@@ -28,7 +28,6 @@ from src.editors.smartprop_editor.property.comment import PropertyComment
 from src.editors.smartprop_editor.property.reference import PropertyReference
 from src.editors.smartprop_editor.property.warning import PropertyWarning
 from src.editors.smartprop_editor.property.path_editor import PropertyPathEditor
-from src.editors.smartprop_editor.property_tooltips import property_tooltips
 from PySide6.QtGui import QCursor
 from src.widgets import HierarchyItemModel
 import uuid
@@ -36,6 +35,7 @@ import uuid
 import ast
 
 from src.widgets import exception_handler
+from src.styles.common import mark_paint_through
 from src.editors.smartprop_editor.property_data_worker import (
     PropertyDataWorker,
 )
@@ -46,33 +46,38 @@ class PropertyFrame(QWidget):
     committed = Signal()
     selected_signal = Signal()
     clicked = Signal(str)
+    # A single property row was selected: (value_class, label). Empty strings
+    # mean the selection was cleared.
+    property_selected = Signal(str, str)
 
     # A lookup dictionary to avoid multiple if/elif checks; cached at class level
     _prop_classes_map_cache = {
         'ModifyState': ['m_nReferenceID', 'm_bEnabled'],
         'Group': ['m_nReferenceID', 'm_bEnabled'],
-        'SmartProp': ['m_nReferenceID', 'm_bEnabled', 'm_sSmartProp'],
+        'SmartProp': ['m_nReferenceID', 'm_bEnabled', 'm_sSmartProp', 'm_bLocalEvaluationState'],
         'PlaceInSphere': ['m_nReferenceID', 'm_bEnabled', 'm_flRandomness', 'm_nCountMin', 'm_nCountMax', 'm_flPositionRadiusInner', 'm_flPositionRadiusOuter', 'm_bAlignOrientation', 'm_PlacementMode', 'm_DistributionMode', 'm_vAlignDirection', 'm_vPlaneUpDirection'],
-        'PlaceMultiple': ['m_nReferenceID', 'm_bEnabled', 'm_nCount'],
-        'PlaceOnPath': ['m_nReferenceID', 'm_bEnabled', 'm_PathName', 'm_vPathOffset', 'm_flOffsetAlongPath', 'm_PathSpace', 'm_flSpacing', 'm_SpacingSpace', 'm_bContinuousSpline', 'm_bUseFixedUpDirection', 'm_bUseProjectedDistance', 'm_vUpDirection', 'm_UpDirectionSpace', 'm_DefaultPath'],
+        'PlaceMultiple': ['m_nReferenceID', 'm_bEnabled', 'm_nCount', 'm_Expression'],
+        'PlaceOnPath': ['m_nReferenceID', 'm_bEnabled', 'm_PathName', 'm_vPathOffset', 'm_flOffsetAlongPath', 'm_PathSpace', 'm_flSpacing', 'm_bUseFixedUpDirection', 'm_bUseProjectedDistance', 'm_vUpDirection', 'm_UpDirectionSpace', 'm_DefaultPathInWorldSpace', 'm_DefaultPath'],
         'FitOnLine': ['m_nReferenceID', 'm_bEnabled', 'm_vStart', 'm_vEnd', 'm_PointSpace', 'm_bOrientAlongLine', 'm_vUpDirection', 'm_UpDirectionSpace', 'm_bPrioritizeUp', 'm_nScaleMode', 'm_nPickMode'],
         'PickOne': ['m_nReferenceID', 'm_bEnabled', 'm_SelectionMode', 'm_SpecificChildIndex', 'm_OutputChoiceVariableName', 'm_bConfigurable', 'm_vHandleOffset', 'm_HandleColor', 'm_HandleSize', 'm_HandleShape'],
-        'Model': ['m_nReferenceID', 'm_bEnabled', 'm_sModelName', 'm_bForceStatic', 'm_vModelScale', 'm_MaterialGroupName', 'm_bDetailObject', 'm_bRigidDeformation', 'm_nLodLevel', 'm_DetailObjectFadeLevel', 'm_nDeformableAttachmentMode', 'm_nDeformableOrientationMode', 'm_bCastShadows', 'm_flUniformModelScale', 'm_SurfacePropertyOverride'],
+        'Model': ['m_nReferenceID', 'm_bEnabled', 'm_sModelName', 'm_vModelScale', 'm_MaterialGroupName', 'm_bDetailObject', 'm_bRigidDeformation', 'm_bDisableDynamicDeformable', 'm_nLodLevel', 'm_nDetailObjectFadeLevel', 'm_bCastShadows', 'm_flUniformModelScale', 'm_SurfacePropertyOverride'],
         'ModelEntity': ['m_nReferenceID', 'm_bEnabled', 'm_sModelName', 'm_vModelScale', 'm_MaterialGroupName', 'm_bDetailObject', 'm_bRigidDeformation', 'm_nLodLevel', 'm_bCastShadows', 'm_bForceStatic', 'm_nDeformableAttachmentMode', 'm_nDeformableOrientationMode'],
         'BendDeformer': ['m_nReferenceID', 'm_bEnabled', 'm_bDeformationEnabled', 'm_vOrigin', 'm_vAngles', 'm_vSize', 'm_flBendAngle', 'm_flBendPoint', 'm_flBendRadius'],
-        'PropPhysics': ['m_nReferenceID', 'm_bEnabled', 'm_sModelName', 'm_vModelScale', 'm_MaterialGroupName', 'm_flMass', 'm_bStartAsleep', 'm_nHealth', 'm_bEnableMotion', 'm_sPhysicsType'],
-        'PropDynamic': ['m_nReferenceID', 'm_bEnabled', 'm_sModelName', 'm_sAnimationSequence', 'm_sDefaultAnimation', 'm_vModelScale', 'm_MaterialGroupName'],
+        'PropPhysics': ['m_nReferenceID', 'm_bEnabled', 'm_sModelName', 'm_MaterialGroupName', 'm_bCastShadows', 'm_bForceStatic', 'm_nDeformableAttachmentMode', 'm_nDeformableOrientationMode', 'm_bStartAsleep'],
+        'PropDynamic': ['m_nReferenceID', 'm_bEnabled', 'm_sModelName', 'm_MaterialGroupName', 'm_bCastShadows', 'm_bForceStatic', 'm_nDeformableAttachmentMode', 'm_nDeformableOrientationMode'],
         'MidpointDeformer': ['m_nReferenceID', 'm_bEnabled', 'm_bDeformationEnabled', 'm_vStart', 'm_vEnd', 'm_fRadius', 'm_bContinuousSpline', 'm_vOffset', 'm_vAngles', 'm_vScale', 'm_fFalloff', 'm_OutputVariable'],
+        'PlaceOnMesh': ['m_nReferenceID', 'm_bEnabled', 'm_nPickMode', 'm_MeshName'],
         'Layout2DGrid': ['m_nReferenceID', 'm_bEnabled', 'm_flWidth', 'm_flLength', 'm_bVerticalLength', 'm_GridArrangement', 'm_GridOriginMode', 'm_nCountW', 'm_nCountL', 'm_flSpacingWidth', 'm_flSpacingLength', 'm_bAlternateShift', 'm_flAlternateShiftWidth', 'm_flAlternateShiftLength'],
         'Grid': ['m_nReferenceID', 'm_bEnabled', 'm_flWidth', 'm_flLength', 'm_bVerticalLength', 'm_GridArrangement', 'm_GridOriginMode', 'm_nCountW', 'm_nCountL', 'm_flSpacingWidth', 'm_flSpacingLength', 'm_bAlternateShift', 'm_flAlternateShiftWidth', 'm_flAlternateShiftLength'],
         'Rotate': ['m_bEnabled', 'm_vRotation'],
         'Scale': ['m_bEnabled', 'm_flScale'],
-        'Translate': ['m_bEnabled', 'm_vPosition'],
-        'SetTintColor': ['m_bEnabled', 'm_Mode', 'm_ColorChoices'],
+        'Translate': ['m_bEnabled', 'm_vPosition', 'm_CoordinateSpace'],
+        'SetTintColor': ['m_bEnabled', 'm_SelectionMode', 'm_ColorSelection', 'm_Mode', 'm_ColorChoices'],
         'MaterialOverride': ['m_bEnabled', 'm_bClearCurrentOverrides', 'm_MaterialReplacements'],
         'MaterialTint': ['m_bEnabled', 'm_Material', 'm_SelectionMode', 'm_Color', 'm_ColorPosition'],
         'RandomOffset': ['m_bEnabled', 'm_vRandomPositionMin', 'm_vRandomPositionMax', 'm_vSnapIncrement'],
         'RandomScale': ['m_bEnabled', 'm_flRandomScaleMin', 'm_flRandomScaleMax', 'm_flSnapIncrement'],
+        'RigidDeformation': ['m_bEnabled'],
         'CreateSizer': ['m_bEnabled', 'm_Name', 'm_bDisplayModel',
                         'm_flInitialMinX', 'm_flInitialMaxX', 'm_flConstraintMinX', 'm_flConstraintMaxX', 'm_OutputVariableMinX', 'm_OutputVariableMaxX',
                         'm_flInitialMinY', 'm_flInitialMaxY', 'm_flConstraintMinY', 'm_flConstraintMaxY', 'm_OutputVariableMinY', 'm_OutputVariableMaxY',
@@ -80,7 +85,7 @@ class PropertyFrame(QWidget):
         'CreateRotator': ['m_bEnabled', 'm_Name', 'm_vOffset', 'm_vRotationAxis', 'm_CoordinateSpace', 'm_flDisplayRadius', 'm_DisplayColor', 'm_bApplyToCurrentTransform', 'm_flSnappingIncrement', 'm_flInitialAngle', 'm_bEnforceLimits', 'm_flMinAngle', 'm_flMaxAngle', 'm_OutputVariable'],
         'CreateLocator': ['m_bEnabled', 'm_LocatorName', 'm_vOffset', 'm_flDisplayScale', 'm_bConfigurable', 'm_bAllowTranslation', 'm_bAllowRotation', 'm_bAllowScale'],
         'RestoreState': ['m_bEnabled', 'm_StateName', 'm_bDiscardIfUknown'],
-        'TraceInDirection': ['m_bEnabled', 'm_DirectionSpace', 'm_flSurfaceUpInfluence', 'm_nNoHitResult', 'm_flOriginOffset', 'm_flTraceLength'],
+        'TraceInDirection': ['m_bEnabled', 'm_Origin', 'm_OriginSpace', 'm_vTraceDirection', 'm_DirectionSpace', 'm_flSurfaceUpInfluence', 'm_nNoHitResult', 'm_flOriginOffset', 'm_flTraceLength', 'm_bIgnoreToolMaterials', 'm_bIgnoreSky', 'm_bIgnoreNoDraw', 'm_bIgnoreTranslucent', 'm_bIgnoreModels', 'm_bIgnoreEntities', 'm_bIgnoreCables'],
         'SaveState': ['m_bEnabled', 'm_StateName'],
         'SetVariable': ['m_bEnabled', 'm_VariableValue'],
         'SetVariableBool': ['m_bEnabled', 'm_VariableName', 'm_VariableValue'],
@@ -107,9 +112,13 @@ class PropertyFrame(QWidget):
         'VariableValue': ['m_bEnabled', 'm_VariableComparison'],
         'EndCap': ['m_bEnabled', 'm_bStart', 'm_bEnd'],
         'ChoiceWeight': ['m_bEnabled', 'm_flWeight'],
-        'IsValid': ['m_bEnabled'],
+        'IsValid': ['m_bEnabled', 'm_Expression'],
         'LinearLength': ['m_bEnabled', 'm_flLength', 'm_bAllowScale', 'm_flMinLength', 'm_flMaxLength'],
         'PathPosition': ['m_bEnabled', 'm_PlaceAtPositions', 'm_nPlaceEveryNthPosition', 'm_nNthPositionIndexOffset', 'm_bAllowAtStart', 'm_bAllowAtEnd'],
+        'EdgeAngleCriteria': ['m_bEnabled', 'm_flMinAngle', 'm_flMaxAngle', 'm_bInvert'],
+        'TopoEdgeCountCriteria': ['m_bEnabled', 'm_nTargetOpenEdgeCount', 'm_bInvert', 'm_bSharedVert'],
+        'VertexCountCriteria': ['m_bEnabled', 'm_nTargetVertexCount'],
+        'MaterialCriteria': ['m_bEnabled', 'm_material', 'm_bInvert'],
         'ComputeDistance3D': ['m_bEnabled', 'm_OutputVariableName', 'm_OutputCoordinateSpace', 'm_InputPositionA', 'm_CoordinateSpaceA', 'm_InputPositionB', 'm_CoordinateSpaceB'],
         'ComputeDotProduct3D': ['m_bEnabled', 'm_OutputVariableName', 'm_InputVectorA', 'm_InputVectorB'],
         'ComputeCrossProduct3D': ['m_bEnabled', 'm_OutputVariableName', 'm_InputVectorA', 'm_InputVectorB'],
@@ -151,6 +160,13 @@ class PropertyFrame(QWidget):
 
     _SKIP_PROPS = frozenset({'_class', 'm_sLabel', 'm_nElementID', 'm_sReferenceObjectID', '_WARN_NOT_VERIFIED'})
 
+    # Rows built per event-loop tick. Small enough that a tick stays well under
+    # a frame, large enough that a typical element finishes in a handful of them.
+    _BUILD_CHUNK = 4
+
+    # Clipboard tag for a single copied property value.
+    _FIELD_CLIP_TAG = "hammer5tools:smartprop_editor_field"
+
     # Class-level copy for batch/prewarm workers (same keys as instance only_variable_properties).
     _ONLY_VARIABLE_PROPERTIES = ()
 
@@ -170,7 +186,7 @@ class PropertyFrame(QWidget):
         ('m_DistributionMode', ['RANDOM', 'UNIFORM'], ['DistributionMode']),
         ('m_SpacingSpace', ['ELEMENT', 'OBJECT', 'WORLD'], ['CoordinateSpace']),
         ('m_sPhysicsType', ['normal', 'multiplayer'], ['String']),
-        ('m_DetailObjectFadeLevel', ['NONE', 'MOST_AGGRESSIVE', 'MORE_AGGRESSIVE', 'NORMAL', 'LESS_AGGRESSIVE', 'LEAST_AGGRESSIVE'], ['String']),
+        ('m_nDetailObjectFadeLevel', ['NONE', 'MOST_AGGRESSIVE', 'MORE_AGGRESSIVE', 'NORMAL', 'LESS_AGGRESSIVE', 'LEAST_AGGRESSIVE'], ['String']),
         ('m_RotationAxes', ['X', 'Y', 'Z', 'XY', 'XZ', 'YZ', 'XYZ'], ['Axes']),
         ('m_HandleShape', ['SQUARE', 'DIAMOND', 'CIRCLE'], ['HandleShape']),
         ('m_nDeformableAttachmentMode', ['RELATIVE', 'SNAP', 'STIFFEN'], ['SmartPropDeformableAttachMode_t']),
@@ -188,6 +204,15 @@ class PropertyFrame(QWidget):
         ('m_EndPointSpaceA', ['ELEMENT', 'OBJECT', 'WORLD'], ['CoordinateSpace']),
         ('m_EndPointSpaceB', ['ELEMENT', 'OBJECT', 'WORLD'], ['CoordinateSpace']),
     )
+
+    # Per-(prop_class, field) combobox overrides — checked before the memoized
+    # field-name-only _COMBOBOX_SUBSTRING_RULES lookup below, since that memo can't
+    # distinguish two classes reusing the same field name for different enums.
+    # PlaceOnMesh's m_nPickMode (FIRST_OPEN_EDGE/FIRST_CLOSED_EDGE/UVMAP1/UVMAP2) vs
+    # FitOnLine's m_nPickMode (LARGEST_FIRST/RANDOM/ALL_IN_ORDER) is the current case.
+    _CLASS_FIELD_COMBOBOX_OVERRIDES = {
+        ('PlaceOnMesh', 'm_nPickMode'): (['FIRST_OPEN_EDGE', 'FIRST_CLOSED_EDGE', 'UVMAP1', 'UVMAP2'], ['OrientationMode']),
+    }
 
     # Populated lazily in _resolve_dispatch() ΓÇö ordered prefix fallthrough.
     _PREFIX_DISPATCH: list = []
@@ -237,6 +262,7 @@ class PropertyFrame(QWidget):
             'm_Expression':            (PropertyString,  {'expression_bool': True,  'placeholder': 'Expression example: var_bool ? var_sizer * var_multiply'}),
             'm_StateName':             (PropertyString,  {'expression_bool': False, 'only_string': True, 'placeholder': 'State name'}),
             'm_LocatorName':           (PropertyString,  {'expression_bool': False, 'placeholder': 'Locator name'}),
+            'm_MeshName':              (PropertyString,  {'expression_bool': False, 'placeholder': 'Mesh name'}),
             'm_VariableName':          (PropertyVariableOutput,  {'filter_types': ['String', 'Int', 'Float', 'Bool', 'Vector3D', 'Color']}),
             'm_OutputVariableName':    (PropertyVariableOutput,  {'filter_types': ['String', 'Int', 'Float', 'Bool', 'Vector3D']}),
             'm_OutputVariableMaxZ':    (PropertyVariableOutput,  {}),
@@ -248,6 +274,7 @@ class PropertyFrame(QWidget):
             'm_OutputVariable':        (PropertyVariableOutput,  {}),
             'm_OutputChoiceVariableName': (PropertyVariableOutput, {}),
             'm_DefaultPath':           (PropertyPathEditor,           {}),
+            'm_DefaultPathInWorldSpace': (PropertyBool,               {}),
             '_WARN_NOT_VERIFIED':      (PropertyWarning,              {}),
         }
 
@@ -304,6 +331,18 @@ class PropertyFrame(QWidget):
         super().__init__(parent)
         self.ui = Ui_Form()
         self.ui.setupUi(self)
+        # Two stylesheets would otherwise paint over everything paintEvent draws:
+        # the .ui's flat "background-color: #1C1C1C" on the form, and the
+        # application-wide "QWidget { background-color: #151515; }". Replace the
+        # first with an explicit transparent rule, which also beats the second
+        # (a widget's own sheet wins over the application sheet). paintEvent
+        # then supplies the base colour, the zebra stripes and the highlight.
+        self.setStyleSheet("")
+        # frame_layout sits between this frame and the rows, and an opaque child
+        # covers whatever paintEvent draws. Marking it beats editing its
+        # stylesheet: the .ui keeps owning its border-top and margins, and a
+        # dynamic property costs nothing next to restyling a whole subtree.
+        mark_paint_through(self.ui.frame_layout)
         # Mirrors insertWidget(0, ...) order ΓÇö avoids O(n) layout scan in on_edited.
         self._property_widgets: list = []
         self._is_selected = False
@@ -341,6 +380,14 @@ class PropertyFrame(QWidget):
             self.ui.delete_button.setIconSize(QSize(16, 16))
 
         self.only_variable_properties = list(self._ONLY_VARIABLE_PROPERTIES)
+
+        # Chunked build state (see _finish_init).
+        self._build_offset = 0
+        self._build_generation = 0
+        # Currently selected property row, for help / copy / paste.
+        self._selected_row = None
+        # One deferred restripe in flight at a time (see paintEvent).
+        self._zebra_pending = False
 
         # Worker result storage
         self._ordered_pairs = None
@@ -399,18 +446,26 @@ class PropertyFrame(QWidget):
         self._worker_raw_value_with_class["_class"] = f"{self.name_prefix}_{self.name}"
 
     def _finish_init(self):
+        """Build the first chunk of rows, then hand the rest to the event loop.
+
+        Rows cost 18-67 ms each to construct, so a 15-field element takes most
+        of a second to build in one go and the panel stays blank for all of it.
+        Building _BUILD_CHUNK rows per event-loop tick lets the first rows paint
+        almost immediately and the rest stream in; total work is unchanged, but
+        the panel stops looking frozen.
+
+        on_edited() is NOT called here — the value dict stays incomplete until
+        _finalize_build() runs after the last chunk.
+        """
         try:
             self.parent()
         except RuntimeError:
             return  # underlying C/C++ object has been deleted
 
-        """
-        Phase 1: populate the first 4 property widgets immediately for fast
-        perceived response. The remaining properties are deferred one tick.
-        on_edited() is NOT called here ΓÇö the value dict is incomplete until
-        Phase 2 finishes.
-        """
-        self._add_properties_by_class(limit=4)
+        self._build_offset = 0
+        self._build_generation += 1
+        # `or 0` — exception_handler swallows errors and returns None.
+        self._build_offset += self._add_properties_by_class(limit=self._BUILD_CHUNK) or 0
         self.show_child()
 
         # Connect once per PropertyFrame lifetime (pool reuse / repeated _finish_init).
@@ -420,51 +475,164 @@ class PropertyFrame(QWidget):
 
         self.init_ui()
 
-        # Defer Phase 2 one event-loop tick (no artificial ms delay)
-        QTimer.singleShot(0, self._finish_init_phase2)
+        self._schedule_next_chunk()
 
-    def _finish_init_phase2(self):
+    def _schedule_next_chunk(self):
+        generation = self._build_generation
+        QTimer.singleShot(0, lambda g=generation: self._build_next_chunk(g))
+
+    def _build_next_chunk(self, generation: int):
+        """Build one more chunk of rows; finalize once none are left."""
+        if generation != self._build_generation:
+            return  # frame was reconfigured out from under this build
         try:
             self.parent()
         except RuntimeError:
             return  # underlying C/C++ object has been deleted
 
+        added = self._add_properties_by_class(
+            offset=self._build_offset, limit=self._BUILD_CHUNK
+        ) or 0
+        self._build_offset += added
+        if added == self._BUILD_CHUNK:
+            self._schedule_next_chunk()
+        else:
+            self._finalize_build()
+
+    def _finalize_build(self):
+        """Run once every row exists: warning row, field suppression, first commit.
+
+        _setup_layout2dgrid_suppression requires ALL widgets to be present, and
+        on_edited() is called here for the first time — the value dict is only
+        complete now.
         """
-        Phase 2: populate remaining properties and finalize the value dict.
-        _setup_layout2dgrid_suppression requires ALL widgets to be present.
-        on_edited() is called here for the first time ΓÇö value dict is now complete.
-        """
-        self._add_properties_by_class(offset=4)
-        
-        # Add unverified warning at the VERY END of both phases; prepend=True
+        # Add unverified warning at the VERY END of the build; prepend=True
         # forces it to the absolute top of the layout regardless of build order.
         if "_WARN_NOT_VERIFIED" in self.value:
             self._add_widget_for_property('_WARN_NOT_VERIFIED', self.value.get("_WARN_NOT_VERIFIED"), force=True, prepend=True)
 
         self._setup_layout2dgrid_suppression()
-        self._apply_zebra()
         self.on_edited()
 
+    def paintEvent(self, event):
+        """Keep the row stripes in step with whatever is currently visible.
+
+        Rows appear and disappear from a lot of places — chunked building, the
+        2D-grid field suppression, and every logic_switch that swaps a row
+        between value/variable/expression mode — so rather than hunting down
+        each of those call sites, the parity is checked against what is on
+        screen right here and corrected when it has drifted. zebra_plan() is a
+        walk over ~20 frames returning nothing in the steady state, so the check
+        is not worth avoiding; the repolish is deferred out of the paint because
+        restyling a widget mid-paint is not allowed.
+        """
+        super().paintEvent(event)
+        if not self._zebra_pending and compact.zebra_plan(
+            self.ui.layout, self._selected_row
+        ):
+            self._zebra_pending = True
+            QTimer.singleShot(0, self._apply_zebra)
+
     def _apply_zebra(self):
-        """Paint alternating row backgrounds (Source2-style) over the child
-        property rows in visual (top-to-bottom) order. Multi-row editors (e.g.
-        Vector3D: header + X/Y/Z) advance the stripe per sub-row so their
-        components alternate too. Re-applied on every (re)build so pooled rows
-        never keep a stale stripe colour."""
-        from src.editors.smartprop_editor.property import compact
-        idx = 0
-        layout = self.ui.layout
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-            w = item.widget() if item is not None else None
-            frames = getattr(w, "_compact_frames", None)
-            if w is None or not frames:
-                continue
-            # Container bg = the first sub-row's colour (only shows in gaps).
-            compact.set_widget_bg(w, compact.zebra_color(idx))
-            for f in frames:
-                compact.set_frame_bg(f, compact.zebra_color(idx))
-                idx += 1
+        self._zebra_pending = False
+        compact.assign_zebra(self.ui.layout, selected=self._selected_row)
+
+    # ── Per-property selection ──────────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        """Select the property row the user pressed on.
+
+        Only clicks landing on the row's own inert area reach here; clicks that
+        land on a child control are handled by the focus route in
+        LegacyPropertyList, which covers keyboard navigation too.
+        """
+        if event.type() == QEvent.MouseButtonPress and obj in self._property_widgets:
+            self.select_row(obj)
+        return super().eventFilter(obj, event)
+
+    def select_row(self, widget) -> None:
+        """Mark ``widget`` as the selected property row and announce it."""
+        if widget is not None and widget not in self._property_widgets:
+            return
+        if widget is self._selected_row:
+            return
+        self._selected_row = widget
+        self._apply_zebra()
+        value_class = getattr(widget, 'value_class', '') or ''
+        self.property_selected.emit(value_class, self._row_label(widget))
+
+    def row_for_widget(self, widget):
+        """Walk up from ``widget`` to the property row containing it, if any."""
+        while widget is not None:
+            if widget in self._property_widgets:
+                return widget
+            if widget is self:
+                return None
+            widget = widget.parentWidget()
+        return None
+
+    @staticmethod
+    def _row_label(widget) -> str:
+        """The row's on-screen label, for the help panel title."""
+        ui = getattr(widget, 'ui', None)
+        field = getattr(ui, 'property_class', None) if ui is not None else None
+        if field is not None:
+            try:
+                return field.text()
+            except RuntimeError:
+                pass
+        return getattr(widget, 'value_class', '') or ''
+
+    # ── Per-property copy / paste ───────────────────────────────────────────
+
+    def copy_property(self) -> bool:
+        """Put the selected row's value on the clipboard. False if nothing to copy."""
+        row = self._selected_row
+        if row is None:
+            return False
+        value_class = getattr(row, 'value_class', None)
+        if not value_class:
+            return False
+        # Row values are {value_class: payload}; None means "Default" mode.
+        payload = getattr(row, 'value', None)
+        if isinstance(payload, dict):
+            payload = payload.get(value_class)
+        QApplication.clipboard().setText(
+            f"{self._FIELD_CLIP_TAG};;{value_class};;{payload!r}"
+        )
+        return True
+
+    @classmethod
+    def _clipboard_has_property(cls) -> bool:
+        return QApplication.clipboard().text().startswith(cls._FIELD_CLIP_TAG + ";;")
+
+    def paste_property(self) -> bool:
+        """Apply a copied value to the selected row. False if it can't be applied.
+
+        The value is applied to whichever row is selected, not to the field it
+        was copied from — copying a spacing onto a length is the useful case.
+        Commits through on_edited(), so the change lands on the undo stack like
+        any other edit.
+        """
+        row = self._selected_row
+        if row is None:
+            return False
+        value_class = getattr(row, 'value_class', None)
+        if not value_class:
+            return False
+
+        parts = QApplication.clipboard().text().split(";;")
+        if len(parts) < 3 or parts[0] != self._FIELD_CLIP_TAG:
+            return False
+        try:
+            payload = ast.literal_eval(parts[2])
+        except (ValueError, SyntaxError):
+            return False
+
+        if not self.update_property_value(value_class, payload):
+            return False
+        self.on_edited()
+        return True
 
     @exception_handler
     def _add_widget_for_property(self, value_class, val, force=False, prepend=False):
@@ -491,12 +659,9 @@ class PropertyFrame(QWidget):
             # acquire to avoid top-level flash); show after reparenting.
             property_instance.show()
 
-            # Apply tooltips if available for this property.
-            if hasattr(property_instance, 'ui') and hasattr(property_instance.ui, 'property_class'):
-                tip_entry = property_tooltips.get(value_class, "")
-                tip = tip_entry.get("description", "") if isinstance(tip_entry, dict) else tip_entry
-                if tip:
-                    property_instance.ui.property_class.setToolTip(tip)
+            # Descriptions are shown in the help panel (Section 3) on selection
+            # rather than as a hover tooltip — see _select_row.
+            property_instance.installEventFilter(self)
 
             if hasattr(property_instance, 'slider_pressed'):
                 property_instance.slider_pressed.connect(self.slider_pressed)
@@ -615,6 +780,22 @@ class PropertyFrame(QWidget):
             add_instance()
             return
 
+        # Per-class combobox override (same field name, different enum per class) —
+        # checked ahead of the field-name-only memo below, which can't tell classes apart.
+        override = PropertyFrame._CLASS_FIELD_COMBOBOX_OVERRIDES.get((self.prop_class, value_class))
+        if override is not None:
+            items, fts = override
+            property_instance = PropertyCombobox.acquire(
+                value=val,
+                value_class=value_class,
+                variables_scrollArea=self.variables_scrollArea,
+                items=list(items),
+                filter_types=list(fts),
+                element_id_generator=self.element_id_generator,
+            )
+            add_instance()
+            return
+
         # Combobox substring dispatch — memoized per distinct field name so the
         # ~30-entry rule list is scanned at most once per field name, ever.
         combo = PropertyFrame._COMBOBOX_MEMO.get(value_class, False)
@@ -668,14 +849,15 @@ class PropertyFrame(QWidget):
 
     @exception_handler
     def _add_properties_by_class(self, limit=None, offset=0):
-        # This function adds property widgets when needed
+        """Add up to ``limit`` rows starting at ``offset``. Returns how many
+        entries were consumed, so the chunked builder knows when it is done."""
         try:
             parent_widget = self.ui.layout.parentWidget()
             if parent_widget is not None:
                 parent_widget.setUpdatesEnabled(False)
         except RuntimeError:
             # Widget or layout was destroyed before this scheduled update ran
-            return
+            return 0
 
         try:
             # Prefer worker-prepared ordered pairs (Plan 5).
@@ -694,6 +876,7 @@ class PropertyFrame(QWidget):
             sliced = ordered_pairs[offset:end]
             for value_class, val_data in sliced:
                 self._add_widget_for_property(value_class, val_data)
+            return len(sliced)
         finally:
             if parent_widget is not None:
                 parent_widget.setUpdatesEnabled(True)
@@ -785,6 +968,25 @@ class PropertyFrame(QWidget):
                     w.setParent(None)
                     w.deleteLater()
         self._property_widgets.clear()
+        self._selected_row = None
+
+    def dispose(self):
+        """Tear this frame down, returning its rows to the per-class pools.
+
+        The only supported way for an owner to drop a PropertyFrame. Going
+        straight to deleteLater() destroys the child rows along with the frame,
+        so PooledPropertyMixin's pools never refill and every subsequent build
+        pays cold construction (18-67 ms per row, against 0.4 ms for a pooled
+        reconfigure).
+        """
+        self.cancel_worker()
+        # Invalidate any in-flight worker results (race safety).
+        self._worker_generation = getattr(self, "_worker_generation", 0) + 1
+        self._ordered_pairs = None
+        self._clear_widgets()
+        self.hide()
+        self.setParent(None)
+        self.deleteLater()
 
     def _reconfigure(
         self,
@@ -1011,13 +1213,13 @@ class PropertyFrame(QWidget):
             set_list_visible([self._w_count_w, self._w_count_l, self._w_alt, self._w_shift_w, self._w_shift_l], False)
 
     def init_ui(self):
-        if self.element:
-            pass
-        else:
-            self.setContextMenuPolicy(Qt.CustomContextMenu)
-            if not self._context_menu_signal_connected:
-                self.customContextMenuRequested.connect(self.show_context_menu)
-                self._context_menu_signal_connected = True
+        # The context menu carries the per-property Copy/Paste entries, so it is
+        # wired up in element mode too (where the component-level entries, owned
+        # by Section 1, are left out).
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        if not self._context_menu_signal_connected:
+            self.customContextMenuRequested.connect(self.show_context_menu)
+            self._context_menu_signal_connected = True
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1055,42 +1257,40 @@ class PropertyFrame(QWidget):
 
     def show_context_menu(self):
         context_menu = QMenu()
-        delete_action = QAction("Delete", context_menu)
-        copy_action = QAction("Copy", context_menu)
-        context_menu.addActions([delete_action, copy_action])
-        
-        asset_action = None
-        asset_path = None
-        if isinstance(self.value, dict):
-            for k, v in self.value.items():
-                if isinstance(v, str) and v.endswith(('.vmdl', '.vmat', '.vtex', '.vpcf', '.vsnd', '.vsmart')):
-                    asset_path = v
-                    break
-        elif isinstance(self.value, str) and self.value.endswith(('.vmdl', '.vmat', '.vtex', '.vpcf', '.vsnd', '.vsmart')):
-            asset_path = self.value
-            
-        if asset_path:
-            import os
-            from src.settings.main import get_addon_name, get_cs2_path
-            cs2_path = get_cs2_path()
-            addon = get_addon_name()
-            if cs2_path and addon:
-                full_asset_path = os.path.normpath(os.path.join(cs2_path, 'content', 'csgo_addons', addon, asset_path.replace('//', '/').replace('\\', '/')))
-                if os.path.exists(full_asset_path):
-                    context_menu.addSeparator()
-                    asset_action = context_menu.addAction(f"Export {os.path.basename(asset_path)}...")
 
+        # ── Selected property row ───────────────────────────────────────────
+        copy_property_action = paste_property_action = None
+        row = self._selected_row
+        if row is not None:
+            label = self._row_label(row)
+            copy_property_action = QAction(f"Copy '{label}'", context_menu)
+            paste_property_action = QAction(f"Paste into '{label}'", context_menu)
+            paste_property_action.setEnabled(self._clipboard_has_property())
+            context_menu.addActions([copy_property_action, paste_property_action])
+
+        # ── Whole component ─────────────────────────────────────────────────
+        # In element mode Section 1 owns delete/copy of the component itself.
+        delete_action = copy_action = None
+        if not self.element:
+            if not context_menu.isEmpty():
+                context_menu.addSeparator()
+            delete_action = QAction("Delete", context_menu)
+            copy_action = QAction("Copy", context_menu)
+            context_menu.addActions([delete_action, copy_action])
+
+        if context_menu.isEmpty():
+            return
         action = context_menu.exec(QCursor.pos())
-        if action == delete_action:
+        if action is None:
+            return
+        if action == copy_property_action:
+            self.copy_property()
+        elif action == paste_property_action:
+            self.paste_property()
+        elif delete_action is not None and action == delete_action:
             self.delete_action()
-        elif action == copy_action:
+        elif copy_action is not None and action == copy_action:
             self.copy_action()
-        elif asset_action and action == asset_action:
-            main_window = self.window()
-            if hasattr(main_window, 'open_asset_exporter'):
-                main_window.open_asset_exporter()
-                if hasattr(main_window, 'asset_exporter_window'):
-                    main_window.asset_exporter_window.select_file(full_asset_path)
 
     def copy_action(self):
         clipboard = QApplication.clipboard()
@@ -1132,6 +1332,13 @@ class PropertyFrame(QWidget):
 
     def keyPressEvent(self, event):
         from PySide6.QtGui import QKeySequence
+        # A selected property row takes precedence: Ctrl+C/Ctrl+V then act on
+        # that one field rather than on the whole component.
+        if self._selected_row is not None:
+            if event.matches(QKeySequence.Copy) and self.copy_property():
+                return
+            if event.matches(QKeySequence.Paste) and self.paste_property():
+                return
         if event.matches(QKeySequence.Copy) and self._is_selected:
             self.copy_action()
             return
@@ -1140,17 +1347,7 @@ class PropertyFrame(QWidget):
     def delete_action(self):
         self.value = None
         self.edited.emit()
-        self.cancel_worker()
-        # Invalidate any in-flight worker results (race safety).
-        self._worker_generation = getattr(self, "_worker_generation", 0) + 1
-        self._ordered_pairs = None
-
-        # Deferred import to avoid circular import at module load time.
-        try:
-            from src.editors.smartprop_editor.property_widget_pool import PropertyWidgetPool
-            PropertyWidgetPool.instance().release(self.prop_class, self)
-        except Exception:
-            self.deleteLater()
+        self.dispose()
 
 
 PropertyFrame._build_ordered_pairs_cache()

@@ -175,6 +175,7 @@ class SmartPropDocument(QMainWindow):
         self.ui.tree_hierarchy_widget.setAcceptDrops(True)
         self.ui.tree_hierarchy_widget.setDropIndicatorShown(True)
         self.ui.tree_hierarchy_widget.setDragDropMode(QTreeWidget.InternalMove)
+        self.ui.tree_hierarchy_widget.external_drop_handler = self.drop_files_into_hierarchy
         self.ui.tree_hierarchy_widget.itemDoubleClicked.connect(self._on_hierarchy_item_about_to_edit)
         self.ui.tree_hierarchy_widget.itemChanged.connect(self._on_hierarchy_item_changed)
 
@@ -722,6 +723,12 @@ class SmartPropDocument(QMainWindow):
         return super().eventFilter(source, event)
 
     # [Tree Widget Hierarchy New Element]
+    def _safe_parent_item(self, candidate):
+        """Model/SmartProp elements are leaf-only; redirect to beside them, not inside them."""
+        if candidate is not None and not (candidate.flags() & Qt.ItemIsDropEnabled):
+            return candidate.parent() or self.ui.tree_hierarchy_widget.invisibleRootItem()
+        return candidate
+
     def add_preset(self):
         from src.common import get_all_presets, SmartPropEditor_Internal_Preset_Path, SmartPropEditor_User_Preset_Path
         presets = get_all_presets(SmartPropEditor_Internal_Preset_Path, SmartPropEditor_User_Preset_Path)
@@ -912,7 +919,12 @@ class SmartPropDocument(QMainWindow):
                         )
 
     def add_an_element(self):
-        self.popup_menu = PopupMenu(elements_list, add_once=False, window_name="SPE_elements")
+        hide_experimental = get_settings_bool('SmartPropEditor', 'hide_experimental', True)
+        visible_list = [
+            item for item in elements_list
+            if not (hide_experimental and any(v.get('_WARN_NOT_VERIFIED') for v in item.values() if isinstance(v, dict)))
+        ]
+        self.popup_menu = PopupMenu(visible_list, add_once=False, window_name="SPE_elements")
         self.popup_menu.add_property_signal.connect(lambda name, value: self.new_element(name, value))
         self.popup_menu.show()
 
@@ -925,9 +937,18 @@ class SmartPropDocument(QMainWindow):
             item for item in elements_list
             if any(k in bookmarked_items for k in item.keys())
         ]
+        hide_experimental = get_settings_bool('SmartPropEditor', 'hide_experimental', True)
+        if hide_experimental:
+            fav_elements = [
+                item for item in fav_elements
+                if not any(v.get('_WARN_NOT_VERIFIED') for v in item.values() if isinstance(v, dict))
+            ]
 
         if not fav_elements:
-            fav_elements = elements_list
+            fav_elements = [
+                item for item in elements_list
+                if not (hide_experimental and any(v.get('_WARN_NOT_VERIFIED') for v in item.values() if isinstance(v, dict)))
+            ]
 
         self.popup_menu = PopupMenu(fav_elements, add_once=False, window_name="SPE_elements")
         self.popup_menu.add_property_signal.connect(lambda name, value: self.new_element(name, value))
@@ -1006,6 +1027,12 @@ class SmartPropDocument(QMainWindow):
         for item in force_items:
             if item not in elements_in_popupmenu:
                 elements_in_popupmenu.append(item)
+        hide_experimental = get_settings_bool('SmartPropEditor', 'hide_experimental', True)
+        if hide_experimental:
+            elements_in_popupmenu = [
+                item for item in elements_in_popupmenu
+                if not any(v.get('_WARN_NOT_VERIFIED') for v in item.values() if isinstance(v, dict))
+            ]
         self.popup_menu = PopupMenu(
             elements_in_popupmenu,
             add_once=True,
@@ -1056,6 +1083,13 @@ class SmartPropDocument(QMainWindow):
         for item in force_items:
             if item not in elements_in_popupmenu:
                 elements_in_popupmenu.append(item)
+
+        hide_experimental = get_settings_bool('SmartPropEditor', 'hide_experimental', True)
+        if hide_experimental:
+            elements_in_popupmenu = [
+                item for item in elements_in_popupmenu
+                if not any(v.get('_WARN_NOT_VERIFIED') for v in item.values() if isinstance(v, dict))
+            ]
 
         self.popup_menu = PopupMenu(
             elements_in_popupmenu,
@@ -1398,6 +1432,54 @@ class SmartPropDocument(QMainWindow):
 
         return item_visible or any_child_visible
 
+    def drop_files_into_hierarchy(self, paths, target_item):
+        """Create elements for .vmdl / .vsmart files dropped onto the hierarchy from the explorer."""
+        from src.settings.main import debug
+        addon_path = get_addon_dir()
+        items = []
+        for path in paths:
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in ('.vmdl', '.vsmart'):
+                continue
+            try:
+                rel_path = os.path.relpath(path, addon_path).replace(os.path.sep, '/')
+            except ValueError:
+                continue
+            if rel_path.startswith('..'):
+                debug(f'Dropped file is outside the addon, skipping: {path}')
+                continue
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            if ext == '.vsmart':
+                element = {
+                    '_class': 'CSmartPropElement_SmartProp',
+                    'm_sSmartProp': rel_path,
+                    'm_Modifiers': [],
+                    'm_SelectionCriteria': []
+                }
+            else:
+                element = {
+                    '_class': 'CSmartPropElement_Model',
+                    'm_sModelName': rel_path,
+                    'm_Modifiers': [],
+                    'm_SelectionCriteria': []
+                }
+            element['m_sLabel'] = base_name
+            self.element_id_generator.update_value(element)
+            items.append(HierarchyItemModel(
+                _name=base_name,
+                _data=element,
+                _class=get_clean_class_name_value(element),
+                _id=self.element_id_generator.get_key(element)
+            ))
+        if not items:
+            return
+        parent_item = self._safe_parent_item(target_item) or self.ui.tree_hierarchy_widget.invisibleRootItem()
+        command = BulkModelImportCommand(self, parent_item, items)
+        command.setText("Drop Files")
+        self.undo_stack.push(command)
+        self._modified = True
+        self._edited.emit()
+
     def open_bulk_model_importer(self):
         from src.editors.smartprop_editor.actions.bulk_model_importer import BulkModelImporterDialog
         from src.editors.smartprop_editor._common import get_clean_class_name_value, get_label_id_from_value
@@ -1410,6 +1492,8 @@ class SmartPropDocument(QMainWindow):
             parent_item = self.ui.tree_hierarchy_widget.currentItem()
             if parent_item is None:
                 parent_item = self.ui.tree_hierarchy_widget.invisibleRootItem()
+            else:
+                parent_item = self._safe_parent_item(parent_item)
             items = []
             for index, file_path in enumerate(files):
                 rel_path = os.path.relpath(file_path, addon_path).replace(os.path.sep, '/')

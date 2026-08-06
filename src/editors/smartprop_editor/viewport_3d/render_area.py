@@ -134,6 +134,9 @@ class SmartProp3DRenderArea(QOpenGLWidget):
         self.show_widgets = True
         self.isolated_element_id = None
         self.isolated_element_name = ""
+        # When on, the isolated element follows the selection instead of being
+        # pinned by the manual Ctrl+H toggle.
+        self.dynamic_isolation = False
         self.current_transform_text = None
 
         # Scene Data (populated from document tree)
@@ -497,11 +500,11 @@ class SmartProp3DRenderArea(QOpenGLWidget):
     def _render_scene_models(self, view, proj, cam_pos, picking=False, mask_id=None):
         from OpenGL import GL
 
-        # ``mask_id`` renders a selection silhouette: every element is drawn with
-        # the flat picking shader, but the element whose id == mask_id is painted
-        # solid white and all others black, so the resulting buffer is that one
-        # element's depth-occluded silhouette.  It shares the picking shader/geometry
-        # path, hence the combined ``use_pick`` flag below.
+        # ``mask_id`` renders a selection silhouette: only the element whose id ==
+        # mask_id is drawn (flat white, via the picking shader), everything else is
+        # skipped so it stays the FBO's cleared black -- giving an x-ray silhouette
+        # that ignores any other mesh occluding it.  It shares the picking
+        # shader/geometry path, hence the combined ``use_pick`` flag below.
         use_pick = picking or (mask_id is not None)
 
         # Resolve context addon from opened file
@@ -550,6 +553,9 @@ class SmartProp3DRenderArea(QOpenGLWidget):
         transparent_items = []
 
         for eid, info in self._model_infos.items():
+            if mask_id is not None and eid != mask_id:
+                continue
+
             pos = info.get("position", [0.0, 0.0, 0.0])
             rot = info.get("rotation", [0.0, 0.0, 0.0])
             scale = info.get("scale", [1.0, 1.0, 1.0])
@@ -891,7 +897,8 @@ class SmartProp3DRenderArea(QOpenGLWidget):
         """Create (or resize) the single-sample selection-mask framebuffer.
 
         Colour is a sampleable texture (the outline pass reads it); depth is a
-        renderbuffer so the silhouette is correctly occluded by nearer geometry.
+        renderbuffer required for FBO completeness (the mask pass renders with
+        depth testing off, for the x-ray silhouette -- see _render_selection_outline).
         """
         from OpenGL import GL
 
@@ -931,11 +938,12 @@ class SmartProp3DRenderArea(QOpenGLWidget):
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
 
     def _render_selection_outline(self, view, proj, cam_pos):
-        """Draw a silhouette outline around the currently selected mesh.
+        """Draw an x-ray silhouette outline around the currently selected mesh.
 
-        Two passes: (1) render the selected element's depth-occluded silhouette as
-        white-on-black into the mask FBO; (2) a fullscreen pass dilates that mask
-        and paints the ring just outside the silhouette over the visible scene.
+        Two passes: (1) render the selected element's full silhouette (depth test
+        off, so nearer geometry can't hide any of it) as white-on-black into the
+        mask FBO; (2) a fullscreen pass dilates that mask and paints the ring just
+        outside the silhouette over the visible scene -- visible through occluders.
 
         Only loaded meshes are outlined here — group dots and not-yet-loaded model
         placeholders keep their own wireframe-box selection markers.
@@ -960,8 +968,11 @@ class SmartProp3DRenderArea(QOpenGLWidget):
         GL.glClearColor(0.0, 0.0, 0.0, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         GL.glDisable(GL.GL_BLEND)
-        GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glDepthMask(GL.GL_TRUE)
+        # Depth test off: the mask should capture the selected mesh's full
+        # silhouette, not just the parts visible past whatever else is in front
+        # of it -- that's what makes the outline read as x-ray.
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDepthMask(GL.GL_FALSE)
         self._render_scene_models(view, proj, cam_pos, mask_id=self._selected_id)
 
         # ---- Pass 2: composite outline over the visible framebuffer ----------
@@ -1128,10 +1139,18 @@ class SmartProp3DRenderArea(QOpenGLWidget):
         # Unload any cached models the hierarchy no longer references so the
         # viewport's memory footprint follows the tree (GPU frees happen on the
         # next paint, inside the GL context).
-        referenced_paths = {
-            info.get("path", "") for info in self._model_infos.values() if info.get("path")
-        }
-        self.mesh_cache.prune(referenced_paths)
+        #
+        # Not while isolated: the visible set is then a small slice of the
+        # hierarchy, not a truthful "what the document still uses", so pruning
+        # against it would free every hidden model and force a full reload the
+        # moment the isolation moves to another element or clears — which is
+        # every selection change in dynamic isolation mode.  Whatever really was
+        # removed from the tree is reclaimed by the next unisolated rebuild.
+        if self.isolated_element_id is None:
+            referenced_paths = {
+                info.get("path", "") for info in self._model_infos.values() if info.get("path")
+            }
+            self.mesh_cache.prune(referenced_paths)
 
         # Sync selection gizmo transform if selection exists
         if self._selected_id in self._model_infos:
@@ -1143,10 +1162,32 @@ class SmartProp3DRenderArea(QOpenGLWidget):
 
         self.update()
 
+    def _follow_selection_isolation(self):
+        """Point the isolation at the current selection while dynamic mode is on.
+
+        Returns True when the scene was rebuilt (the caller can skip its own
+        gizmo sync — update_viewport() already did it).
+        """
+        target = self._selected_id if (self.dynamic_isolation and self._selected_id) else None
+        if target == self.isolated_element_id:
+            return False
+        self.isolated_element_id = target
+        self.isolated_element_name = ""
+        self.update_viewport()
+        return True
+
+    @gl_guard("event")
+    def set_dynamic_isolation(self, enabled: bool):
+        """Enable/disable selection-following isolation (clears it when off)."""
+        self.dynamic_isolation = bool(enabled)
+        self._follow_selection_isolation()
+
     @gl_guard("event")
     def highlight_element(self, element_id: int):
         """Select/Highlight element and reposition gizmo."""
         self._selected_id = element_id
+        if self._follow_selection_isolation():
+            return
         if element_id != 0 and element_id in self._model_infos:
             sel = self._model_infos[element_id]
             self.gizmo.set_transform(sel["position"], sel["rotation"], sel["scale"])
@@ -1968,14 +2009,31 @@ class SmartProp3DRenderArea(QOpenGLWidget):
 
         stack.append(norm_key)
         try:
-            with open(full_vsmart_path, "r") as f:
-                content = f.read()
-            content = re.sub(re.compile(r"= resource_name:"), "= ", content)
-            content = content.replace("null,", "")
-            from src.common import Kv3ToJson
-            vsmart_data = Kv3ToJson(content)
+            # Read + KV3-parse only when the file actually changed.  Every
+            # update_viewport() re-walks the whole hierarchy — and in dynamic
+            # isolation mode that is once per selection change — so without this
+            # each nested prop pays a disk read and a full KV3 parse per rebuild.
+            cache = getattr(self, "_nested_vsmart_cache", None)
+            if cache is None:
+                cache = self._nested_vsmart_cache = {}
+            mtime = os.path.getmtime(full_vsmart_path)
+            cached = cache.get(norm_key)
+            if cached is not None and cached[0] == mtime:
+                vsmart_data = cached[1]
+            else:
+                with open(full_vsmart_path, "r") as f:
+                    content = f.read()
+                content = re.sub(re.compile(r"= resource_name:"), "= ", content)
+                content = content.replace("null,", "")
+                from src.common import Kv3ToJson
+                vsmart_data = Kv3ToJson(content)
+                cache[norm_key] = (mtime, vsmart_data)
 
-            self._traverse_vsmart_dict(vsmart_data, models_list, world_matrix, addon)
+            # Traverse a copy: the element dicts end up in _model_infos, where the
+            # gizmo/modifier helpers write into them.  The cached parse has to stay
+            # pristine — it stands in for the file on disk.
+            import copy
+            self._traverse_vsmart_dict(copy.deepcopy(vsmart_data), models_list, world_matrix, addon)
         except Exception as e:
             print(f"[SmartPropEditor] Failed to load/traverse nested smart prop {smartprop_path}: {e}")
         finally:

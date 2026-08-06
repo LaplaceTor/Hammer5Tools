@@ -1,6 +1,7 @@
 import time
 from datetime import datetime, timezone
 import os
+import shutil
 import zipfile
 import subprocess
 import argparse
@@ -244,6 +245,7 @@ def build_app_pyinstaller(fast=False, channel='stable') -> None:
     if not os.path.exists(bspsrc_exe):
         print(f"WARNING: bspsrc.exe not found at {bspsrc_exe}! SourcePorter BSP decompiler will be missing in build.")
     import_scripts_dir = os.path.join(cur_dir, 'tools', 'import_scripts')
+    ue_scripts_dir = os.path.join(cur_dir, 'tools', 'ue_scripts')
 
     pyinstaller_cmd = [
         sys.executable, '-m', 'PyInstaller',
@@ -291,6 +293,7 @@ def build_app_pyinstaller(fast=False, channel='stable') -> None:
         f'--add-data={source_porter_publish};source_porter' if os.path.exists(source_porter_publish) else '',
         f'--add-data={bspsrc_dir};tools/bspsrc' if os.path.exists(bspsrc_dir) else '',
         f'--add-data={import_scripts_dir};tools/import_scripts' if os.path.exists(import_scripts_dir) else '',
+        f'--add-data={ue_scripts_dir};tools/ue_scripts' if os.path.exists(ue_scripts_dir) else '',
         *( [f'--add-binary=src{os.sep}external{os.sep}{dll};external{os.sep}{dll}' for dll, _ in dotnet_dlls] if channel == 'stable' else [] ),
         *( get_dotnet_runtime_data() if channel == 'stable' else [] ),
         f'--add-data={runtime_config_path};dotnet' if channel == 'stable' and os.path.exists(runtime_config_path) else '',
@@ -327,7 +330,6 @@ def build_hammer5_tools(fast=False, channel='stable') -> None:
     # Flatten the PyInstaller output: move contents from out_hammer5tools/Hammer5Tools_Core/ up to Hammer5Tools/
     pyi_output = os.path.join(cur_dir, 'out_hammer5tools', 'Hammer5Tools_Core')
     if os.path.exists(pyi_output):
-        import shutil
         for item in os.listdir(pyi_output):
             src = os.path.join(pyi_output, item)
             dst = os.path.join(bundle_root, item)
@@ -398,7 +400,6 @@ def main() -> None:
             # Phase 0: Cleanup
             bundle_root = os.path.join(cur_dir, 'Hammer5Tools')
             if os.path.exists(bundle_root):
-                import shutil
                 for item in ['app', 'Hammer5Tools.exe', 'Hammer5Tools_Core.exe', 'fileedit.exe', '_internal']:
                     path = os.path.join(bundle_root, item)
                     if os.path.exists(path):
