@@ -51,7 +51,11 @@ _FOLDERS = {
 
 def classify(key: str):
     """The category an asset key belongs to, or None if it doesn't look like any."""
-    lowered = key.replace("\\", "/").lower()
+    # Leading slash matters: the folder patterns are written "/materials/", and
+    # the bridge's keys are relative ("Materials/Bin_01.uasset"), so without it
+    # every folder sitting at the root of Content failed to match and the whole
+    # project came back unclassified.
+    lowered = "/" + key.replace("\\", "/").lower().lstrip("/")
     if lowered.endswith(".umap"):
         return "Scenes"
     name = os.path.basename(lowered)
@@ -75,13 +79,24 @@ def category_counts(keys) -> dict:
 
 
 def format_counts(keys) -> str:
-    """"Models 43 | Materials 5 | Blueprints 3 | Maps 7" — empty categories omitted."""
+    """"Models 43  |  Maps 7  |  Other 12  —  62 total" — empty categories omitted.
+
+    Every key is accounted for. classify() only recognises Unreal's own naming
+    convention, and plenty of projects (marketplace packs especially) do not
+    follow it — so dropping what it cannot place made the label read "Maps 1"
+    for a 237-asset project. Unclassified assets port exactly like any other;
+    they just cannot be named here, which is what "Other" says.
+    """
+    keys = list(keys)
+    if not keys:
+        return ""
     counts = category_counts(keys)
-    return "  |  ".join(
-        f"{label} {counts[category]}"
-        for category, label in CATEGORY_LABELS.items()
-        if counts.get(category)
-    )
+    parts = [f"{label} {counts[category]}"
+             for category, label in CATEGORY_LABELS.items() if counts.get(category)]
+    other = len(keys) - sum(counts.values())
+    if other:
+        parts.append(f"Other {other}")
+    return "  |  ".join(parts) + f"  —  {len(keys)} total"
 
 
 def asset_stem(key: str) -> str:
@@ -553,10 +568,24 @@ def demo():
 
     assert category_counts(keys) == {"Scenes": 1, "Models": 1, "Materials": 1, "Textures": 1}
     line = format_counts(keys)
-    assert line == "Models 1  |  Materials 1  |  Textures 1  |  Maps 1", line
+    assert line == "Models 1  |  Materials 1  |  Textures 1  |  Maps 1  —  4 total", line
     # Empty categories are omitted, not printed as zero.
-    assert format_counts(["P/Content/Maps/A.umap"]) == "Maps 1"
+    assert format_counts(["P/Content/Maps/A.umap"]) == "Maps 1  —  1 total"
     assert format_counts([]) == ""
+
+    # The bridge's keys are relative to Content, so a top-level folder has no
+    # leading slash. Requiring one classified an entire project as nothing.
+    assert classify("Materials/Bin_01.uasset") == "Materials"
+    assert classify("Blueprints/Fan.uasset") == "Blueprints"
+    assert classify("Meshes/Chair.uasset") == "Models"
+    assert classify("Maps/MainMap.umap") == "Scenes"
+
+    # The label must still account for every asset: whatever genuinely cannot be
+    # placed ports like any other and is counted, not silently dropped.
+    unnamed = ["P/Content/Misc/Thing.uasset", "P/Content/Misc/Other.uasset"]
+    line = format_counts(unnamed + ["P/Content/Maps/A.umap"])
+    assert line == "Maps 1  |  Other 2  —  3 total", line
+    assert format_counts(unnamed) == "Other 2  —  2 total"
 
     _demo_tree(keys)
     print("ok")

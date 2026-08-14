@@ -22,11 +22,12 @@ from src.styles.common import apply_stylesheets
 from src.settings.common import get_addon_dir, get_addon_name
 from src.editors.smartprop_editor.property import compact
 
+from src.editors.smartprop_editor.viewport_3d.vmdl_reader import get_model_material_groups
 from .hierarchy import (
     DetailPropTree, KIND_TYPE, payload,
     get_selection_path, find_item_by_path, restore_selection_path,
 )
-from .rows import ModelRow, SectionHeader, build_row, apply_zebra, FloatRow, pretty_name
+from .rows import ModelRow, MaterialGroupRow, SectionHeader, build_row, apply_zebra, FloatRow, pretty_name
 from .schema import MODEL_FIELDS_BY_KEY, MODEL_FIELD_GROUPS, TYPE_FIELDS
 from .vdata_io import get_vdata_path, load_vdata, save_vdata
 
@@ -302,9 +303,8 @@ class DetailPropEditorWidget(QMainWindow):
         self.hierarchy.load(load_vdata(self.vdata_path))
         self.setToolTip(self.vdata_path)
         self.undo_stack.clear()
-        self._set_title("" if existed else " *")
-        if not existed:
-            self._modified = True
+        self._modified = False
+        self._set_title("")
         if existed:
             parent = self.parent()
             if parent is not None and hasattr(parent, "update_title"):
@@ -406,14 +406,32 @@ class DetailPropEditorWidget(QMainWindow):
         self.property_layout.addWidget(summary)
 
     def _render_model(self, item, data):
+        model_row = None
+        mat_group_row = None
+        model_path = data.get("m_ModelName", "")
+        skins = get_model_material_groups(model_path)
+
         for group_name, keys in MODEL_FIELD_GROUPS:
             self.property_layout.addWidget(SectionHeader(group_name))
             for key in keys:
                 field = MODEL_FIELDS_BY_KEY[key]
-                row = build_row(field, data.get(key, field.default))
+                val = data.get(key, field.default)
+                if field.kind == "material_group":
+                    row = build_row(field, val, choices=skins)
+                    mat_group_row = row
+                else:
+                    row = build_row(field, val)
                 if isinstance(row, ModelRow):
+                    model_row = row
                     row.browse_requested.connect(lambda r=row: self._browse_model(r))
                 self._add_row(row, item, key)
+
+        if model_row is not None and mat_group_row is not None:
+            def _on_model_changed():
+                new_model = model_row.value()
+                new_skins = get_model_material_groups(new_model)
+                mat_group_row.set_choices(new_skins)
+            model_row.line.textChanged.connect(_on_model_changed)
 
     # browse
 
@@ -440,20 +458,14 @@ class DetailPropEditorWidget(QMainWindow):
         if parent is not None and hasattr(parent, "update_title"):
             parent.update_title('saved', self.vdata_path)
 
+    def has_unsaved_changes(self) -> bool:
+        return self._modified
+
+    def unsaved_files(self):
+        """(label, save_callable) for detail_prop_types.vdata if modified."""
+        if self._modified and self.vdata_path:
+            return [(self.vdata_path, self.save)]
+        return []
+
     def closeEvent(self, event):
-        if self._modified:
-            reply = QMessageBox.question(
-                self,
-                "Unsaved Changes",
-                "You have unsaved changes. Do you want to save them before closing?",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
-            )
-            if reply == QMessageBox.Yes:
-                self.save()
-                event.accept()
-            elif reply == QMessageBox.No:
-                event.accept()
-            else:
-                event.ignore()
-        else:
-            event.accept()
+        event.accept()

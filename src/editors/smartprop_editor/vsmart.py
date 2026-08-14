@@ -269,9 +269,14 @@ class VsmartOpen:
         else:
             debug(f"Choices: {data}")
             for choice in data:
-                name = choice["m_Name"]
+                name = (
+                    choice.get("m_Name") or
+                    choice.get("m_sChoiceName") or
+                    choice.get("m_sName") or
+                    "Choice"
+                )
                 default = choice.get("m_DefaultOption", None)
-                options = choice.get("m_Options", None)
+                options = choice.get("m_Options", []) or []
                 choice_item = AddChoice(
                     name=name,
                     tree=self.choices_tree,
@@ -279,16 +284,36 @@ class VsmartOpen:
                     variables_scrollArea=self.variables_scrollArea
                 ).item
                 for option in options:
-                    option_item = AddOption(parent=choice_item, name=option["m_Name"]).item
-                    variables = option["m_VariableValues"]
+                    opt_name = (
+                        option.get("m_Name") or
+                        option.get("m_sName") or
+                        option.get("m_sOptionName") or
+                        "Option"
+                    )
+                    option_item = AddOption(parent=choice_item, name=opt_name).item
+                    variables = option.get("m_VariableValues", []) or []
                     for variable in variables:
+                        target_name = (
+                            variable.get("m_TargetName") or
+                            variable.get("m_sVariableName") or
+                            variable.get("m_VariableName") or
+                            variable.get("m_Name") or
+                            ""
+                        )
+                        target_type = (
+                            variable.get("m_DataType") or
+                            variable.get("m_sDataType") or
+                            variable.get("m_Type") or
+                            ""
+                        )
+                        target_val = variable.get("m_Value", variable.get("m_sValue", ""))
                         AddVariable(
                             self.element_id_generator,
                             parent=option_item,
                             variables_scrollArea=self.variables_scrollArea,
-                            name=variable["m_TargetName"],
-                            type=variable.get("m_DataType", ""),
-                            value=variable["m_Value"]
+                            name=target_name,
+                            type=target_type,
+                            value=target_val
                         )
 
     def fix_names(self, parent):
@@ -348,12 +373,29 @@ class VsmartSave:
         raw_variables = self.get_variables(self.variables_layout)
         for var_key, var_key_value in raw_variables.items():
             var_default = var_key_value[2]["default"]
+            var_class = var_key_value[1]
             if var_default is None:
-                var_default = ""
+                if var_class == "Color":
+                    var_default = [255, 255, 255]
+                elif var_class == "Bool":
+                    var_default = False
+                elif var_class == "Vector3D":
+                    var_default = [1, 1, 1]
+                elif var_class == "Vector2D":
+                    var_default = [0, 0]
+                elif var_class == "Vector4D":
+                    var_default = [0, 0, 0, 0]
+                elif var_class == "Int":
+                    var_default = 0
+                elif var_class == "Float":
+                    var_default = 0.0
+                else:
+                    var_default = ""
+            elif var_class == "Color" and (var_default == "" or not isinstance(var_default, (list, tuple)) or len(var_default) < 3):
+                var_default = [255, 255, 255]
             var_min = var_key_value[2]["min"]
             var_max = var_key_value[2]["max"]
             var_model = var_key_value[2]["model"]
-            var_class = var_key_value[1]
             var_id = var_key_value[2]["m_nElementID"]
             var_hide_expression = var_key_value[2]["m_HideExpression"]
             var_read_only_expression = var_key_value[2].get("m_ReadOnlyExpression")
@@ -487,18 +529,35 @@ class VsmartSave:
                     variable_child = option_child.child(variable_index)
                     variable_widget = parent.treeWidget().itemWidget(variable_child, 1)
                     variable_combobox = parent.treeWidget().itemWidget(variable_child, 0)
-                    if variable_widget is None:
-                        variables.append({})
-                    else:
-                        out = {"m_TargetName": variable_combobox.combobox.currentText()}
+                    
+                    var_name = ""
+                    if variable_combobox and hasattr(variable_combobox, "combobox"):
+                        var_name = variable_combobox.combobox.currentText()
+                        if var_name == "None":
+                            var_name = ""
+                    elif variable_combobox and hasattr(variable_combobox, "currentText"):
+                        var_name = variable_combobox.currentText()
+                    if not var_name:
+                        var_name = variable_child.text(0)
+
+                    out = {"m_TargetName": var_name}
+                    if variable_widget and hasattr(variable_widget, "data"):
                         out.update(variable_widget.data)
-                        variables.append(out)
-                options.append({"m_Name": option_child.text(0), "m_VariableValues": variables})
+                    else:
+                        out["m_DataType"] = "String"
+                        out["m_Value"] = variable_child.text(1)
+                    variables.append(out)
+                options.append({
+                    "_class": "CSmartPropChoiceOption",
+                    "m_Name": option_child.text(0),
+                    "m_VariableValues": variables
+                })
+            default_val = widget.currentText() if widget and hasattr(widget, "currentText") else None
             choice = {
                 "_class": "CSmartPropChoice",
                 "m_Name": child.text(0),
                 "m_Options": options,
-                "m_DefaultOption": widget.currentText() if widget else None,
+                "m_DefaultOption": default_val if default_val and default_val != "None" else "",
                 "m_nElementID": set_ElementID(force=True)
             }
             update_child_ElementID_value(choice, force=True)

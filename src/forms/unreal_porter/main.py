@@ -106,10 +106,11 @@ class AnalyzeWorker(CancellableWorker):
     progress = Signal(int, int)
     done = Signal(dict)   # the manifest, or {} on failure
 
-    def __init__(self, uproject_path, project_dir, parent=None):
+    def __init__(self, uproject_path, project_dir, output_dir, parent=None):
         super().__init__(parent)
         self.uproject_path = uproject_path
         self.project_dir = project_dir
+        self.output_dir = output_dir
 
     def run(self):
         from .bridge_client import UnrealBridge, BridgeError
@@ -153,7 +154,8 @@ class AnalyzeWorker(CancellableWorker):
             return
 
         try:
-            manifest = analysis.save(self.uproject_path, self.project_dir, assets, info, materials)
+            manifest = analysis.save(self.uproject_path, self.project_dir, self.output_dir,
+                                     assets, info, materials)
         except OSError as e:
             # A cache we cannot persist is a slower next run, not a failure.
             self.log.emit(f"Could not write the analysis cache: {e}", "warn")
@@ -172,10 +174,12 @@ class ExpandRefsWorker(CancellableWorker):
     progress = Signal(int, int)
     done = Signal(set, dict)
 
-    def __init__(self, uproject_path, project_dir, chosen, all_keys, refs_map=None, parent=None):
+    def __init__(self, uproject_path, project_dir, output_dir, chosen, all_keys,
+                 refs_map=None, parent=None):
         super().__init__(parent)
         self.uproject_path = uproject_path
         self.project_dir = project_dir
+        self.output_dir = output_dir
         self.chosen = chosen
         self.all_keys = all_keys
         self.refs_map = refs_map
@@ -199,7 +203,7 @@ class ExpandRefsWorker(CancellableWorker):
             # Fall back to exactly what was ticked rather than losing the picks.
             selected = set(self.chosen)
         # Whatever was read this time is worth keeping even if the walk failed.
-        analysis.update_refs(self.uproject_path, new_refs)
+        analysis.update_refs(self.output_dir, new_refs)
         self.done.emit(selected, new_refs)
 
 
@@ -248,6 +252,20 @@ class UnrealPorterWidget(QDialog):
         self.console.info("2. Analyze project")
         self.console.info("3. Select assets you want to port")
         self.console.info("4. Click Convert")
+
+        self.console.header("Limitations")
+        self.console.warn("• Scene override materials (per-actor material overrides on map instances)")
+        self.console.warn("• Cables / Splines (CableComponent physics & spline mesh ropes)")
+        self.console.warn("• Landscapes / Terrain (heightfield layer blending; must bake to static mesh)")
+        self.console.warn("• Master Materials & HLSL graphs (only Material Instance parameters -> vmat)")
+        self.console.warn("• Nanite virtual geometry (export regular LOD triangulated mesh first)")
+        self.console.warn("• Niagara / Cascade particles (must re-author in CS2 particle editor)")
+        self.console.warn("• Virtual Textures / RVT (must bake to standard 2D textures in UE first)")
+        self.console.warn("• Gameplay & Logic Blueprints (only static component layout Blueprints -> vsmart)")
+        self.console.warn("• Lumen & Baked Lightmaps (lighting bakes must be re-authored in Hammer)")
+        self.console.warn("• Skeletal Meshes & Character Rigs (rigged animations / PhAT physics assets)")
+
+        self.console.header("Settings")
         # _build_ui ran before the console existed, so the first report lands here.
         self._log_export_cache()
         # Restores the port picker and re-enables Prepare from cache, without a
@@ -516,10 +534,6 @@ class UnrealPorterWidget(QDialog):
         self.select_assets_button.setEnabled(False)
         self.select_assets_button.clicked.connect(self.on_select_assets)
         scope_layout.addWidget(self.select_assets_button)
-        self.scope_label = QLabel()
-        self.scope_label.setWordWrap(True)
-        self.scope_label.setStyleSheet("color: #9D9D9D;")
-        scope_layout.addWidget(self.scope_label)
         layout.addWidget(scope_box)
 
         settings_box = QGroupBox("General settings")
@@ -539,10 +553,46 @@ class UnrealPorterWidget(QDialog):
         sv.addWidget(self.strip_prefixes_check)
         layout.addWidget(settings_box)
 
+        layout.addWidget(self._build_map_settings_box())
         layout.addWidget(self._build_models_box())
         layout.addWidget(self._build_textures_box())
         layout.addStretch(1)
         return tab
+
+    # Map settings — which non-geometry actors a converted map brings across.
+    # (checkbox attribute, label, settings key, default, tooltip)
+    _MAP_SETTINGS = (
+        ("map_lights_check", "Import light", "map_import_lights", False,
+         "Convert Unreal's point, spot, rect and directional lights into their CS2 "
+         "equivalents (light_omni2, light_rect, light_environment). Intensities are "
+         "converted to lumens; tune a converted light with its Brightness Scale in Hammer."),
+        ("map_sky_check", "Import sky", "map_import_sky", False,
+         "Place an env_sky named 'sky' where Unreal's Sky Light / Sky Atmosphere sits. "
+         "Unreal's sky cubemap is not converted — the entity starts on the default sky material."),
+        ("map_cubemaps_check", "Import cubemaps", "map_import_cubemaps", False,
+         "Convert Unreal's reflection capture actors into env_combined_light_probe_volume "
+         "entities, sized from each capture's influence radius or box extent."),
+        ("map_decals_check", "Import decals", "map_import_decals", True,
+         "Place Unreal's decal actors as CS2 static overlays using the converted decal material."),
+        ("map_mirror_check", "Mirror negative scaled actors", "map_mirror_negative_scale", True,
+         "Source 2 renders a negatively scaled prop inside-out. When an actor's scale flips "
+         "handedness, write a mirrored copy of its model (name_mirror.vmdl) and place that at "
+         "positive scale instead."),
+    )
+
+    def _build_map_settings_box(self):
+        box = QGroupBox("Map settings")
+        v = QVBoxLayout(box)
+        for attr, label, key, default, tooltip in self._MAP_SETTINGS:
+            check = QCheckBox(label)
+            check.setToolTip(tooltip)
+            check.setChecked(get_settings_bool("UnrealConverter", key, default))
+            check.toggled.connect(
+                lambda checked, k=key: set_settings_bool("UnrealConverter", k, checked)
+            )
+            setattr(self, attr, check)
+            v.addWidget(check)
+        return box
 
     def _build_models_box(self):
         box = QGroupBox("Models")
@@ -697,6 +747,19 @@ class UnrealPorterWidget(QDialog):
         return {name: info.get("param_overrides") or {}
                 for name, info in getattr(self, "master_groups", {}).items()}
 
+    def master_feature_flags(self) -> dict:
+        """{master material name: {F_*: "0"/"1"}} from the Materials tab's Feature
+        Inspector. Threaded into convert_material so toggled sections actually
+        reach the written vmat (previously this output was discarded)."""
+        return {name: info.get("feature_flags") or {}
+                for name, info in getattr(self, "master_groups", {}).items()}
+
+    def master_blend_modes(self) -> dict:
+        """{master material name: int F_BLEND_MODE} from the Materials tab's Blend
+        selector (static_overlay only). Threaded into convert_material."""
+        return {name: info.get("blend_mode") or 0
+                for name, info in getattr(self, "master_groups", {}).items()}
+
     @Slot(str)
     def _on_map_master_slots(self, master_name: str):
         if not hasattr(self, "master_groups") or master_name not in self.master_groups:
@@ -719,24 +782,43 @@ class UnrealPorterWidget(QDialog):
             for k, v in (mat_data.get("switches") or {}).items():
                 switches.setdefault(k, v)
 
-        from .slot_mapping import SlotMappingDialog
-        selected_shader = info.get("shader") or "csgo_environment.vfx"
-        dlg = SlotMappingDialog(
+        from .slot_mapping import ShaderRemapperDialog
+        card_shaders = self.master_shader_selection()
+        selected_shader = card_shaders.get(master_name) or info.get("shader") or "csgo_environment.vfx"
+        info["shader"] = selected_shader
+        initial_feature_flags = info.get("feature_flags", {})
+        initial_blend_mode = info.get("blend_mode", 0)
+
+        dlg = ShaderRemapperDialog(
             master_name, textures, initial_overrides,
             shader=selected_shader,
             scalars=scalars, vectors=vectors, switches=switches,
             initial_param_overrides=initial_param_overrides,
+            feature_flags=initial_feature_flags,
+            blend_mode=initial_blend_mode,
             bulk_dir=self.tmp_dir(), parent=self,
         )
         if dlg.exec() == QDialog.Accepted:
             info["slot_overrides"] = dlg.result_overrides
             info["param_overrides"] = dlg.result_param_overrides
+            info["feature_flags"] = getattr(dlg, "result_feature_flags", {})
+            info["blend_mode"] = getattr(dlg, "result_blend_mode", 0)
+            info["shader"] = getattr(dlg, "result_shader", selected_shader)
+            cards = self._master_cards()
+            if cards and hasattr(cards, "cards") and master_name in cards.cards:
+                card = cards.cards[master_name]
+                c_idx = card.shader_combo.findText(info["shader"])
+                if c_idx >= 0:
+                    card.shader_combo.blockSignals(True)
+                    card.shader_combo.setCurrentIndex(c_idx)
+                    card.shader_combo.blockSignals(False)
             self.master_mat_list.refresh(master_name, info)
             slot_count = len(dlg.result_overrides)
             param_count = len(dlg.result_param_overrides)
+            flag_count = len(dlg.result_feature_flags)
             self.console.info(
-                f"Updated mapping for {master_name} "
-                f"({slot_count} slot(s), {param_count} param(s))."
+                f"Updated Shader Remapper for {master_name} "
+                f"({info['shader']}, {slot_count} slot(s), {param_count} param(s), {flag_count} feature(s))."
             )
 
     # helpers
@@ -762,8 +844,7 @@ class UnrealPorterWidget(QDialog):
 
     def browse_uproject(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Unreal Engine Project", "", "Unreal Project (*.uproject);;All Files (*)",
-            options=QFileDialog.DontUseNativeDialog,
+            self, "Select Unreal Engine Project", "", "Unreal Project (*.uproject);;All Files (*)"
         )
         if path:
             self.uproject_edit.setText(path.replace("\\", "/"))
@@ -792,7 +873,6 @@ class UnrealPorterWidget(QDialog):
                 "Save converter log",
                 default_name,
                 "Text Files (*.txt);;All Files (*)",
-                options=QFileDialog.DontUseNativeDialog,
             )
 
             if not filename:
@@ -881,54 +961,6 @@ class UnrealPorterWidget(QDialog):
 
     # analysis
 
-    def ensure_analysis(self, force=False):
-        """Make sure we know what is in the project before anything else runs.
-
-        Cheap path first: if the cached manifest's fingerprint still matches the
-        project on disk, nothing runs at all.
-        """
-        from . import analysis
-
-        uproject = self.uproject_path()
-        project_dir = self.project_dir()
-        if not uproject or not os.path.isfile(uproject) or not os.path.isdir(project_dir):
-            self._set_analysis({}, uproject)
-            return
-
-        if not force:
-            cached = analysis.load(uproject, project_dir)
-            if cached:
-                self.console.info(
-                    f"Using cached analysis from {cached.get('analyzed_at')} "
-                    f"({len(cached.get('assets', []))} asset(s)) — project unchanged."
-                )
-                self._set_analysis(cached, uproject)
-                return
-
-        self.console.header("Analyzing project")
-        self.console.info(f"{os.path.basename(uproject)} — reading assets through the CUE4Parse bridge…")
-        self._set_analysis({}, uproject)
-        self.progress_bar.setFormat("Analyzing…")
-
-        worker = AnalyzeWorker(uproject, project_dir)
-        worker.log.connect(self._on_worker_log)
-        worker.progress.connect(self._on_progress)
-        worker.done.connect(lambda manifest, u=uproject: self._on_analysis_done(manifest, u))
-        self._start_worker("analyze_worker", worker)
-
-    @Slot(dict, str)
-    def _on_analysis_done(self, manifest, uproject):
-        if manifest:
-            info = manifest.get("info") or {}
-            self.console.success(
-                f"Analyzed {os.path.basename(uproject)} ({info.get('game')}): "
-                f"{len(manifest.get('assets', []))} asset(s), {info.get('umaps')} map(s)."
-            )
-        else:
-            self.console.error("Analysis failed — Prepare Assets stays disabled until the project can be read.")
-        self._set_analysis(manifest, uproject)
-        self.progress_bar.setFormat("Idle")
-
     def _update_button_states(self):
         uproject = self.uproject_path() if hasattr(self, "uproject_path") else None
         analyzed = bool(getattr(self, "_analyzed_uproject", None)) and bool(getattr(self, "_project_assets", []))
@@ -962,11 +994,12 @@ class UnrealPorterWidget(QDialog):
             return
 
         if not force:
-            cached = analysis.load(uproject, project_dir)
+            cached = analysis.load(uproject, project_dir, self.output_dir())
             if cached:
                 self.console.info(
                     f"Using cached analysis from {cached.get('analyzed_at')} "
-                    f"({len(cached.get('assets', []))} asset(s)) — project unchanged."
+                    f"({len(cached.get('assets', []))} asset(s), "
+                    f"{len(cached.get('refs') or {})} reference scan(s) cached) — project unchanged."
                 )
                 self._set_analysis(cached, uproject)
                 return
@@ -976,7 +1009,7 @@ class UnrealPorterWidget(QDialog):
         self._set_analysis({}, uproject)
         self.progress_bar.setFormat("Analyzing…")
 
-        worker = AnalyzeWorker(uproject, project_dir)
+        worker = AnalyzeWorker(uproject, project_dir, self.output_dir())
         worker.log.connect(self._on_worker_log)
         worker.progress.connect(self._on_progress)
         worker.done.connect(lambda manifest, u=uproject: self._on_analysis_done(manifest, u))
@@ -1008,23 +1041,31 @@ class UnrealPorterWidget(QDialog):
 
         groups = dict(manifest.get("materials") or {}) if manifest else {}
         if groups:
+            multi_c = sum(1 for g in groups.values() if g.get("count", 0) > 1)
+            single_c = sum(1 for g in groups.values() if g.get("count", 0) <= 1)
+            self.console.info(f"Loading {len(groups)} Master Material group(s) ({multi_c} multi-instance, {single_c} standalone) and texture thumbnails...")
             self._populate_master_materials_table(apply_saved_swaps(groups, self.output_dir()))
-            self.console.info(f"{len(groups)} Master Material group(s) loaded from the analysis.")
+            self.console.success(f"{len(groups)} Master Material group(s) ready with texture bindings and thumbnails.")
         elif manifest:
             self.console.warn("No Master Materials found in the project.")
 
-        self._update_scope_label()
+        self._log_port_scope()
         self._update_button_states()
 
-    def _update_scope_label(self):
-        """Counts per type for whatever is actually going to be ported."""
+    def _log_port_scope(self):
+        """Counts per type for whatever is actually going to be ported.
+
+        Goes to the console rather than a label so the numbers stay on screen
+        next to the run that produced them, instead of being overwritten by the
+        next selection.
+        """
         from .asset_selection import format_counts
 
         keys = self._selected_assets or self._project_assets
         if not keys:
-            self.scope_label.setText("No assets — analyze a project first.")
+            self.console.warn("No assets — analyze a project first.")
             return
-        self.scope_label.setText(format_counts(keys) or f"{len(keys)} asset(s)")
+        self.console.info("Port scope: " + (format_counts(keys) or f"{len(keys)} asset(s)"))
 
     def on_select_assets(self):
         if not self._project_assets:
@@ -1042,7 +1083,7 @@ class UnrealPorterWidget(QDialog):
         if not dlg.selected_keys:
             self._selected_assets = set(self._project_assets)
             self.console.info("Nothing ticked — the whole project will be ported.")
-            self._update_scope_label()
+            self._log_port_scope()
             self._update_button_states()
             return
 
@@ -1050,8 +1091,9 @@ class UnrealPorterWidget(QDialog):
         self.console.info(f"{len(dlg.selected_keys)} asset(s) picked; following their references…")
         self._resolving_refs = True
         self._update_button_states()
-        worker = ExpandRefsWorker(self.uproject_path(), self.project_dir(), dlg.selected_keys,
-                                  self._project_assets, refs_map=self._project_refs)
+        worker = ExpandRefsWorker(self.uproject_path(), self.project_dir(), self.output_dir(),
+                                  dlg.selected_keys, self._project_assets,
+                                  refs_map=self._project_refs)
         worker.log.connect(self._on_worker_log)
         worker.progress.connect(self._on_progress)
         worker.done.connect(self._on_refs_expanded)
@@ -1067,7 +1109,7 @@ class UnrealPorterWidget(QDialog):
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.progress_bar.setFormat("Done")
         self.console.success(f"Port scope: {len(selected)} asset(s) including references.")
-        self._update_scope_label()
+        self._log_port_scope()
         self._update_button_states()
 
     def _scan_tmp(self):
@@ -1205,21 +1247,82 @@ class UnrealPorterWidget(QDialog):
 
     def _start_conversion_pipeline(self):
         output_dir = self.output_dir()
-        did_something = False
 
         # STAGE 3: Converting Master Materials & Material Instances
         self.console.header("(3/6) Converting Master Materials & Material Instances")
+        self._log_shader_swaps()
+        materials_running = False
         if self.is_enabled("Textures") or self.is_enabled("Materials"):
-            did_something = self._convert_materials(output_dir) or did_something
+            materials_running = self._convert_materials(output_dir)
         else:
             self.console.info("Materials/Textures disabled — skipping stage 3.")
 
-        # STAGE 4 & 5: Models & Scenes/Maps
-        if self.is_enabled("Scenes") or self.is_enabled("Models") or self.is_enabled("Blueprints"):
-            self.console.header("(4/6) & (5/6) Converting Models, Blueprints & Maps")
-            did_something = self._convert_scenes_models(output_dir) or did_something
-        else:
+        # STAGE 4 & 5 must wait for stage 3. Both stages write the same vmat
+        # files — stage 3 from the Materials tab's shader choices, the scene
+        # worker from the materials its meshes actually use — so running them on
+        # two threads let whichever finished last win per file, which showed up
+        # as the shader remapping being ignored for an arbitrary subset.
+        if materials_running:
+            self._scene_stage_pending = True
+            return
+        self._start_scene_stage()
+
+    def _start_scene_stage(self):
+        self._scene_stage_pending = False
+        if not (self.is_enabled("Scenes") or self.is_enabled("Models") or self.is_enabled("Blueprints")):
             self._finish_conversion_pipeline()
+            return
+        self.console.header("(4/6) & (5/6) Converting Models, Blueprints & Maps")
+        if not self._convert_scenes_models(self.output_dir()):
+            self._finish_conversion_pipeline()
+
+    def _log_shader_swaps(self):
+        """Print clean, minimal Master Material -> CS2 shader remappings."""
+        swaps = self.master_shader_selection()
+        if not swaps:
+            self.console.warn(
+                "Shader remapping: no Master Material cards loaded — analyze project first."
+            )
+            return
+        groups = getattr(self, "master_groups", {}) or {}
+        self.console.header("(3a/6) Reading Shader Remappings")
+        self.console.info(f"Shader Remappings ({len(swaps)} Master Materials):")
+        for master, shader in sorted(swaps.items()):
+            info = groups.get(master) or {}
+            count = len(info.get("instances", []))
+            blend_str = ""
+            if info.get("blend_mode"):
+                bm = info["blend_mode"]
+                blend_names = {1: "Translucent", 2: "Alpha Test", 3: "Mod2x", 4: "Additive", 5: "Multiply", 6: "ModThenAdd"}
+                blend_str = f" [{blend_names.get(bm, f'Mode {bm}')}]"
+
+            self.console.info(f"  {master} -> {shader}{blend_str} ({count} instances)")
+
+            slot_overrides = info.get("slot_overrides") or {}
+            for param, slot in sorted(slot_overrides.items()):
+                if isinstance(slot, dict):
+                    parts = [f"{s}: {c}" for s, c in slot.items() if s not in ("split_alpha", "split_rgba")]
+                    slot_desc = ", ".join(parts) if parts else str(slot)
+                else:
+                    slot_desc = str(slot)
+                self.console.info(f"    slot {param} -> {slot_desc}")
+
+            for param, target in sorted((info.get("param_overrides") or {}).items()):
+                self.console.info(f"    param {param} -> {target}")
+            for flag, value in sorted((info.get("feature_flags") or {}).items()):
+                self.console.info(f"    feature {flag} = {value}")
+
+        import json
+        raw_remaps = {
+            "shaders": swaps,
+            "slots": {m: info.get("slot_overrides") for m, info in groups.items() if info.get("slot_overrides")},
+            "params": {m: info.get("param_overrides") for m, info in groups.items() if info.get("param_overrides")},
+            "flags": {m: info.get("feature_flags") for m, info in groups.items() if info.get("feature_flags")},
+            "blend_modes": {m: info.get("blend_mode") for m, info in groups.items() if info.get("blend_mode")},
+        }
+        self.console.info("\nRaw Shader Remappings:")
+        for line in json.dumps(raw_remaps, indent=2).splitlines():
+            self.console.info("  " + line)
 
     def _finish_conversion_pipeline(self):
         # STAGE 6: Finalizing conversion
@@ -1254,11 +1357,18 @@ class UnrealPorterWidget(QDialog):
             master_shaders=self.master_shader_selection(),
             master_slot_overrides=self.master_slot_overrides(),
             master_param_overrides=self.master_param_overrides(),
+            master_feature_flags=self.master_feature_flags(),
+            master_blend_modes=self.master_blend_modes(),
             selected_assets=self._selected_assets or None,
             import_lods=self.model_lods_check.isChecked(),
             import_collision=self.model_collision_check.isChecked(),
             tex_format=self.tex_format_combo.currentText(),
             invert_y_normal=self.tex_invert_y_check.isChecked(),
+            import_lights=self.map_lights_check.isChecked(),
+            import_sky=self.map_sky_check.isChecked(),
+            import_cubemaps=self.map_cubemaps_check.isChecked(),
+            import_decals=self.map_decals_check.isChecked(),
+            mirror_negative_scale=self.map_mirror_check.isChecked(),
         )
         worker.log.connect(self._on_worker_log)
         worker.progress.connect(self._on_progress)
@@ -1277,13 +1387,13 @@ class UnrealPorterWidget(QDialog):
         self.console.info("Scenes/Models/Blueprints conversion finished.")
         self._finish_conversion_pipeline()
 
-    def _convert_materials(self, output_dir):
+    def _convert_materials(self, output_dir, ignore_scope=False):
         if not hasattr(self, "master_groups") or not self.master_groups:
             self.console.warn("No Master Materials loaded to convert.")
             return False
 
         from .asset_selection import asset_stem
-        scope = {asset_stem(k) for k in self._selected_assets} if self._selected_assets else None
+        scope = None if (ignore_scope or not self._selected_assets) else {asset_stem(k) for k in self._selected_assets}
 
         cards = self._master_cards()
         checkboxes = cards.checkboxes() if cards else {}
@@ -1311,11 +1421,13 @@ class UnrealPorterWidget(QDialog):
                 "shader": selected_shader,
                 "instances": instances,
                 "enabled": True,
-                # Carry the per-master UI mappings through to the worker; without
-                # these the materials-only convert path ignored both the texture
-                # slot remap and the param mapping the user just configured.
+                # Carry all per-master UI mappings through to the worker; without
+                # these the materials-only convert path ignored slot remap, param mapping,
+                # feature flags, and blend modes configured in the UI.
                 "slot_overrides": info.get("slot_overrides", {}),
                 "param_overrides": info.get("param_overrides", {}),
+                "feature_flags": info.get("feature_flags", {}),
+                "blend_mode": info.get("blend_mode", 0),
             }
 
         if dropped:
@@ -1325,32 +1437,29 @@ class UnrealPorterWidget(QDialog):
             self.console.warn("No Master Material groups selected for conversion.")
             return False
 
-        total_instances = sum(len(g["instances"]) for g in active_master_groups.values())
-        self.console.info(f"Converting {total_instances} material instance(s) across {len(active_master_groups)} Master Material swap group(s)…")
+        from .converter import MasterMaterialConvertWorker
         self.convert_button.setEnabled(False)
+        if hasattr(self, "reconvert_mats_button"):
+            self.reconvert_mats_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Converting Materials…")
 
-        from .converter import MasterMaterialConvertWorker
-
         worker = MasterMaterialConvertWorker(
-            output_dir, self.tmp_dir(), active_master_groups,
+            output_dir=output_dir,
+            bulk_dir=self.tmp_dir(),
+            master_groups=active_master_groups,
             strip_prefix=self.strip_prefixes_check.isChecked(),
             tex_format=self.tex_format_combo.currentText(),
             invert_y_normal=self.tex_invert_y_check.isChecked(),
         )
-        worker.progress.connect(self._on_progress)
         worker.file_done.connect(self._on_file_done)
+        worker.progress.connect(self._on_progress)
         worker.finished.connect(self._on_mat_finished)
-        if not self._start_worker("worker", worker):
-            self._update_button_states()
-            return False
-        return True
+        return self._start_worker("mat_worker", worker)
 
     @Slot(int, int)
     def _on_progress(self, current, total):
-        max_val = total if total > 0 else 100
-        self.progress_bar.setMaximum(max_val)
+        self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
         if total > 0:
             pct = int((current / total) * 100)
@@ -1378,7 +1487,7 @@ class UnrealPorterWidget(QDialog):
         from .material_converter import clear_texture_index_cache
         clear_texture_index_cache()
 
-        scope_assets = list(self._selected_assets) if self._selected_assets else list(self._project_assets)
+        scope_assets = list(self._project_assets) if self._project_assets else list(self._selected_assets)
         missing = self._find_missing_tmp_exports(scope_assets)
         project_dir = self.project_dir()
         if missing and project_dir and os.path.isdir(project_dir):
@@ -1401,11 +1510,12 @@ class UnrealPorterWidget(QDialog):
                 return
 
         self.console.header("Re-converting Materials")
+        self._log_shader_swaps()
         if hasattr(self, "reconvert_mats_button"):
             self.reconvert_mats_button.setEnabled(False)
         self.convert_button.setEnabled(False)
 
-        success = self._convert_materials(output_dir)
+        success = self._convert_materials(output_dir, ignore_scope=True)
         if not success:
             self._update_button_states()
 
@@ -1420,18 +1530,18 @@ class UnrealPorterWidget(QDialog):
         self.console.success("Asset preparation completed successfully.")
         output_dir = self.output_dir()
         self.console.header("Re-converting Materials")
-        success = self._convert_materials(output_dir)
+        success = self._convert_materials(output_dir, ignore_scope=True)
         if not success:
             self._update_button_states()
 
     @Slot(list, list)
     def _on_mat_finished(self, created, skipped):
         self.console.info(f"Materials done — created {len(created)}, skipped {len(skipped)}.")
-        # Stage 3 (materials) and Stage 4/5 (scenes/models) run on two threads,
-        # so "Materials done" fires while the scene worker is still writing
-        # maps/vmdls. Only finalize when nothing else is running — otherwise the
-        # bar flips to "Done" and the buttons re-enable while vmdls are still
-        # being produced, which looks like a hang the user then bails out of.
+        # Stage 4/5 was deferred until the vmats were written; start it now so
+        # the two stages never write the same file at once.
+        if getattr(self, "_scene_stage_pending", False):
+            self._start_scene_stage()
+            return
         scene = getattr(self, "scene_worker", None)
         if scene is not None and scene.isRunning():
             self.progress_bar.setFormat("Converting Models/Scenes…")

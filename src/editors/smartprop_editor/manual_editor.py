@@ -648,11 +648,32 @@ class ManualEditor(QWidget):
             widget = layout.itemAt(i).widget()
             if widget and hasattr(widget, 'name') and hasattr(widget, 'var_class'):
                 from src.editors.smartprop_editor.objects import variable_prefix
+                default_val = widget.var_value.get('default')
+                if default_val is None:
+                    if widget.var_class == "Color":
+                        default_val = [255, 255, 255]
+                    elif widget.var_class == "Bool":
+                        default_val = False
+                    elif widget.var_class == "Vector3D":
+                        default_val = [1, 1, 1]
+                    elif widget.var_class == "Vector2D":
+                        default_val = [0, 0]
+                    elif widget.var_class == "Vector4D":
+                        default_val = [0, 0, 0, 0]
+                    elif widget.var_class == "Int":
+                        default_val = 0
+                    elif widget.var_class == "Float":
+                        default_val = 0.0
+                    else:
+                        default_val = ''
+                elif widget.var_class == "Color" and (default_val == '' or not isinstance(default_val, (list, tuple)) or len(default_val) < 3):
+                    default_val = [255, 255, 255]
+
                 var_dict = {
                     "_class": variable_prefix + widget.var_class,
                     "m_VariableName": widget.name,
                     "m_bExposeAsParameter": widget.var_visible_in_editor,
-                    "m_DefaultValue": widget.var_value.get('default', ''),
+                    "m_DefaultValue": default_val,
                 }
                 if widget.var_value.get('m_nElementID') is not None:
                     var_dict["m_nElementID"] = widget.var_value['m_nElementID']
@@ -687,10 +708,11 @@ class ManualEditor(QWidget):
                 for v in opt.get('variables', []):
                     var_vals.append({
                         "m_TargetName": v['name'],
-                        "m_DataType": v['type'],
+                        "m_DataType": v['type'] or 'String',
                         "m_Value": v['value'],
                     })
                 options.append({
+                    "_class": "CSmartPropChoiceOption",
                     "m_Name": opt['name'],
                     "m_VariableValues": var_vals,
                 })
@@ -839,21 +861,36 @@ class ManualEditor(QWidget):
         state = []
         for ch in choices_list:
             options = []
-            for opt in ch.get("m_Options", []):
+            for opt in ch.get("m_Options", []) or []:
                 variables = []
-                for var in opt.get("m_VariableValues", []):
+                for var in opt.get("m_VariableValues", []) or []:
+                    target_name = (
+                        var.get('m_TargetName') or
+                        var.get('m_sVariableName') or
+                        var.get('m_VariableName') or
+                        var.get('m_Name') or
+                        ''
+                    )
+                    target_type = (
+                        var.get('m_DataType') or
+                        var.get('m_sDataType') or
+                        var.get('m_Type') or
+                        ''
+                    )
                     variables.append({
-                        'name': var.get('m_TargetName', ''),
-                        'type': var.get('m_DataType', ''),
-                        'value': var.get('m_Value', ''),
+                        'name': target_name,
+                        'type': target_type,
+                        'value': var.get('m_Value', var.get('m_sValue', '')),
                     })
+                opt_name = opt.get('m_Name') or opt.get('m_sName') or opt.get('m_sOptionName') or ''
                 options.append({
-                    'name': opt.get('m_Name', ''),
+                    'name': opt_name,
                     'expanded': False,
                     'variables': variables,
                 })
+            ch_name = ch.get('m_Name') or ch.get('m_sChoiceName') or ch.get('m_sName') or ''
             state.append({
-                'name': ch.get('m_Name', ''),
+                'name': ch_name,
                 'default': ch.get('m_DefaultOption', ''),
                 'expanded': False,
                 'options': options,

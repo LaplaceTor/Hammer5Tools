@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
 )
 
 from src.styles.common import apply_stylesheets
-from .material_converter import _classify_textures, find_bulk_texture
+from .material_converter import (
+    _classify_textures, find_bulk_texture, _pick_scalar, _pick_boolean_flags,
+)
 
 # material_remap_arrow.png is not in resources.qrc, so it is loaded from disk —
 # same approach as src/widgets/model_browser/main.py. Resolves to src/icons/...
@@ -26,35 +28,54 @@ _SRC_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 _REMAP_ICON = os.path.join(_SRC_DIR, "icons", "tools", "modeldoc_editor",
                            "material_remap_arrow.png")
 
-SHADERS = [
-    "csgo_environment.vfx",
-    "csgo_environment_blend.vfx",
-    "csgo_static_overlay.vfx",
-    "csgo_foliage.vfx",
-    "csgo_glass.vfx",
-    "csgo_character.vfx",
-    "complex.vfx",
-]
+from .shader_schemas import SHADERS
 
-_CHANNEL_LABELS = {"r": "R", "g": "G", "b": "B", "a": "A"}
+_CHANNEL_LABELS = {"r": "R", "g": "G", "b": "B", "a": "A", "rgb": "RGB"}
 
 
-def describe_bindings(textures: dict, slot_overrides: dict = None, shader: str = None) -> str:
+def describe_bindings(textures: dict, slot_overrides: dict = None, shader: str = None, info: dict = None) -> str:
     """One-line summary of what the current mapping resolves to, e.g.
     'color←Diffuse  normal←Normal  rough←SRMH.G  metal←SRMH.B'."""
     picks = _classify_textures(textures or {}, slot_overrides, shader=shader)
-    return format_picks_summary(picks)
+    return format_picks_summary(picks, info=info)
 
 
-def format_picks_summary(picks: dict) -> str:
-    if not picks:
-        return "No texture slots resolved — this material will convert flat."
+def format_picks_summary(picks: dict, info: dict = None) -> str:
     parts = []
-    for slot in sorted(picks):
-        param, _path, channel = picks[slot]
-        suffix = f".{_CHANNEL_LABELS[channel]}" if channel else ""
-        parts.append(f"{slot}←{param}{suffix}")
-    return "   ".join(parts)
+    if picks:
+        for slot in sorted(picks):
+            param, _path, channel = picks[slot]
+            suffix = f".{_CHANNEL_LABELS.get(channel, str(channel).upper())}" if channel else ""
+            parts.append(f"{slot}←{param}{suffix}")
+
+    scalars = (info or {}).get("scalars") or {}
+    switches = (info or {}).get("switches") or {}
+
+    pbr_parts = []
+
+    rough = _pick_scalar(scalars, "roughness", "tileable 1 roughness", default=None)
+    if rough is not None:
+        pbr_parts.append(f"Roughness: {rough:.2f}")
+
+    metal = _pick_scalar(scalars, "metallic", "metalness", default=None)
+    if metal is not None and metal > 0:
+        pbr_parts.append(f"Metalness: {metal:.2f}")
+
+    auto_flags = _pick_boolean_flags(switches)
+    if auto_flags:
+        clean_flags = [f.replace("F_", "").replace("g_b", "").replace("1", "") for f in auto_flags]
+        pbr_parts.append("Flags: " + ", ".join(clean_flags))
+
+    if parts:
+        summary = "   ".join(parts)
+        if pbr_parts:
+            summary += "  │  " + "   ".join(pbr_parts)
+        return summary
+
+    if pbr_parts:
+        return "Color/PBR Material (No Textures) — " + "   ".join(pbr_parts)
+
+    return "Default PBR material (No textures or color parameters resolved)."
 
 
 _THUMBNAIL_CACHE = {}
@@ -108,10 +129,14 @@ class MasterMaterialCard(QFrame):
         head.addWidget(self.checkbox)
 
         count = info.get("count", len(info.get("instances", [])))
-        title = QLabel(f"<b>{master_name}</b> ({count} instance{'s' if count != 1 else ''})")
+        if count <= 1:
+            title = QLabel(f"<b>{master_name}</b> <span style='color:#9D9D9D;'>(standalone material)</span>")
+        else:
+            title = QLabel(f"<b>{master_name}</b> ({count} instance{'s' if count != 1 else ''})")
         head.addWidget(title)
         head.addStretch(1)
 
+        self.info = info
         self.shader_combo = QComboBox()
         self.shader_combo.addItems(SHADERS)
         predicted = info.get("shader", "csgo_environment.vfx")
@@ -119,10 +144,11 @@ class MasterMaterialCard(QFrame):
         if idx >= 0:
             self.shader_combo.setCurrentIndex(idx)
         self.shader_combo.setToolTip("Target CS2 shader for this Master Material")
+        self.shader_combo.currentTextChanged.connect(self._on_shader_changed)
         head.addWidget(self.shader_combo)
 
         self.map_button = QToolButton()
-        self.map_button.setToolTip(f"Configure texture parameter slot assignments for {master_name}")
+        self.map_button.setToolTip(f"Shader Remapper: Configure CS2 shader, feature flags, and texture slot mappings for {master_name}")
         self.map_button.setIcon(QIcon(_REMAP_ICON))
         self.map_button.clicked.connect(lambda: self.map_slots_requested.emit(self.master_name))
         head.addWidget(self.map_button)
@@ -148,14 +174,20 @@ class MasterMaterialCard(QFrame):
         apply_stylesheets(self)
         self.refresh(info, bulk_dir=self.bulk_dir, tex_index=tex_index)
 
+    def _on_shader_changed(self, new_shader: str):
+        if hasattr(self, "info") and self.info:
+            self.info["shader"] = new_shader
+            self.refresh(self.info)
+
     def refresh(self, info: dict, bulk_dir: str = None, tex_index: dict = None):
+        self.info = info
         if bulk_dir:
             self.bulk_dir = bulk_dir
         textures = info.get("textures", {})
         slot_overrides = info.get("slot_overrides", {})
-        shader = info.get("shader")
+        shader = info.get("shader") or self.shader_combo.currentText()
         picks = _classify_textures(textures, slot_overrides, shader=shader)
-        self.bindings.setText(format_picks_summary(picks))
+        self.bindings.setText(format_picks_summary(picks, info=info))
         self._update_thumbnails(picks, tex_index=tex_index)
 
     def _update_thumbnails(self, picks: dict, tex_index: dict = None):
@@ -212,6 +244,29 @@ class MasterMaterialList(QScrollArea):
         self._layout.addStretch(1)
         self.setWidget(self._body)
 
+    @staticmethod
+    def _make_standalone_divider(label_text: str) -> QFrame:
+        """Divider with a label separating material groups (e.g. multi-instance vs standalone)."""
+        container = QFrame()
+        container.setFrameShape(QFrame.NoFrame)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(12, 8, 12, 4)
+        layout.setSpacing(8)
+
+        def _line():
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setStyleSheet("color: #363639;")
+            return line
+
+        layout.addWidget(_line(), 1)
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet("color: #9D9D9D; font: 600 9pt 'Segoe UI'; background: transparent;")
+        layout.addWidget(lbl)
+        layout.addWidget(_line(), 1)
+        apply_stylesheets(container)
+        return container
+
     def populate(self, master_groups: dict, bulk_dir: str = None):
         self.bulk_dir = bulk_dir
         self._body.setUpdatesEnabled(False)
@@ -230,11 +285,37 @@ class MasterMaterialList(QScrollArea):
             from .material_converter import get_texture_index
             tex_index = get_texture_index(self.bulk_dir) if self.bulk_dir else None
 
-            for i, (name, info) in enumerate(sorted(master_groups.items())):
-                card = MasterMaterialCard(name, info, parity=(i % 2 == 1), bulk_dir=self.bulk_dir, tex_index=tex_index)
+            # Sort by instance count descending so the most-used masters are on top.
+            sorted_groups = sorted(
+                master_groups.items(),
+                key=lambda item: item[1].get("count", len(item[1].get("instances", []))),
+                reverse=True,
+            )
+
+            # Partition into multi-instance and single-instance (standalone) groups.
+            multi = [(n, i) for n, i in sorted_groups
+                     if i.get("count", len(i.get("instances", []))) > 1]
+            single = [(n, i) for n, i in sorted_groups
+                      if i.get("count", len(i.get("instances", []))) <= 1]
+
+            idx = 0
+            for name, info in multi:
+                card = MasterMaterialCard(name, info, parity=(idx % 2 == 1), bulk_dir=self.bulk_dir, tex_index=tex_index)
                 card.map_slots_requested.connect(self.map_slots_requested)
                 self._layout.addWidget(card)
                 self.cards[name] = card
+                idx += 1
+
+            if single:
+                self._layout.addWidget(
+                    self._make_standalone_divider("Standalone Materials (no instances)")
+                )
+                for name, info in single:
+                    card = MasterMaterialCard(name, info, parity=(idx % 2 == 1), bulk_dir=self.bulk_dir, tex_index=tex_index)
+                    card.map_slots_requested.connect(self.map_slots_requested)
+                    self._layout.addWidget(card)
+                    self.cards[name] = card
+                    idx += 1
 
             self._layout.addStretch(1)
         finally:
@@ -256,9 +337,9 @@ class MasterMaterialList(QScrollArea):
 
 
 def demo():
-    """Builds the list with two fake masters — one plain, one packed SRMH — and
-    checks the binding summary without needing a UE project. Pass --show to
-    open the window and eyeball it.
+    """Builds the list with multi-instance and standalone masters, verifies
+    sorting (descending by count) and the divider. Pass --show to open the
+    window and eyeball it.
 
         python -m src.forms.unreal_porter.master_material_list [--show]
     """
@@ -279,12 +360,23 @@ def demo():
         },
         "Decal": {"count": 5, "shader": "csgo_static_overlay.vfx",
                   "textures": {"Diffuse": "/Game/T/TrashDecal01_D.TrashDecal01_D"}},
+        "M_SingleUse": {"count": 1, "shader": "csgo_environment.vfx",
+                        "textures": {"Diffuse": "/Game/T/Floor_D.Floor_D"}},
     })
-    assert set(widget.cards) == {"bese_material", "Decal"}
+    assert set(widget.cards) == {"bese_material", "Decal", "M_SingleUse"}
     summary = widget.cards["bese_material"].bindings.text()
     assert "rough←SRMH.G" in summary, summary
     assert "metal←SRMH.B" in summary, summary
     assert "color←Diffuse" in summary, summary
+
+    # Verify card ordering: multi-instance first (sorted desc by count),
+    # then the divider widget, then single-instance.
+    card_widgets = [widget._layout.itemAt(i).widget()
+                    for i in range(widget._layout.count())
+                    if widget._layout.itemAt(i).widget()]
+    card_names = [w.master_name for w in card_widgets if isinstance(w, MasterMaterialCard)]
+    assert card_names == ["bese_material", "Decal", "M_SingleUse"], card_names
+
     # Repopulating must not leave the previous cards behind.
     stale_combo = widget.shader_combos()["Decal"]
     widget.populate({"only": {"count": 1, "textures": {}}})
@@ -304,9 +396,15 @@ def demo():
     assert widget.shader_combos() == {} and widget.checkboxes() == {}
 
     if "--show" in sys.argv:
-        widget.populate({"bese_material": {"count": 22, "textures": {
-            "Diffuse": "/Game/T/Box_D.Box_D", "SRMH": "/Game/T/Box_SRM.Box_SRM"}}})
-        widget.resize(760, 300)
+        widget.populate({
+            "bese_material": {"count": 22, "textures": {
+                "Diffuse": "/Game/T/Box_D.Box_D", "SRMH": "/Game/T/Box_SRM.Box_SRM"}},
+            "M_Foliage": {"count": 8, "shader": "csgo_foliage.vfx", "textures": {}},
+            "M_StandaloneWood": {"count": 1, "shader": "csgo_environment.vfx", "textures": {
+                "Diffuse": "/Game/T/Wood_D.Wood_D"}},
+            "M_StandaloneMetal": {"count": 1, "shader": "csgo_environment.vfx", "textures": {}},
+        })
+        widget.resize(760, 400)
         widget.show()
         return app.exec()
     print("ok")

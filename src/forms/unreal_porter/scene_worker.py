@@ -5,6 +5,7 @@ per-step feedback to the converter's console.
 """
 
 import os
+import re
 import shutil
 from PySide6.QtCore import QThread, Signal
 
@@ -13,7 +14,9 @@ from ._worker_base import CancellableWorker
 from .bridge_client import UnrealBridge, BridgeError
 from .vmap_writer import write_vmap
 from .vsmart_writer import write_vsmart
-from .vmdl_writer import write_vmdl, ue_mesh_to_model_path, find_bulk_export_mesh, GRAYBOX_VMAT
+from .vmdl_writer import (
+    write_vmdl, ue_mesh_to_model_path, mirrored_model_path, find_bulk_export_mesh, GRAYBOX_VMAT,
+)
 from .engine_meshes import is_engine_mesh, generate_engine_mesh_obj, bundled_fbx_for
 
 _MESH_EXTS = (".fbx", ".obj", ".gltf", ".glb", ".dmx")
@@ -37,8 +40,26 @@ def _is_external_ref(key_or_ref) -> bool:
     if "'" in ref:                       # Class'/Game/Path/Name.Name'
         ref = ref.split("'", 2)[1] if ref.count("'") >= 2 else ref
     ref = ref.strip().replace("\\", "/").lower()
+    return ref.startswith("/") and not ref.startswith("/game/")
+
+
 _NON_MESH_PREFIXES = ("t_", "tx_", "tex_", "m_", "mi_", "mm_", "mf_", "cue_", "ns_", "ps_", "wbp_", "bpi_")
 _NON_MESH_FOLDERS = ("/textures/", "/materials/", "/audio/", "/sounds/", "/particles/", "/ui/", "/widget/")
+
+
+def _object_path_to_key(ue_object_path: str) -> str:
+    """UE object path -> the asset key the bridge addresses packages by.
+
+    "/Game/Kowloon/Meshes/Decals/D_Dirt_01.D_Dirt_01" -> "Kowloon/Meshes/Decals/D_Dirt_01"
+    The bridge mounts Content as the root, so the /Game/ prefix and the
+    trailing ".ObjectName" both have to come off — passing the object path
+    through verbatim fails with "there is no game file with the path".
+    """
+    ref = str(ue_object_path or "")
+    if "'" in ref:                       # Class'/Game/Path/Name.Name'
+        ref = ref.split("'", 2)[1] if ref.count("'") >= 2 else ref
+    ref = ref.strip().replace("\\", "/").split(".", 1)[0]
+    return re.sub(r"^/?[Gg]ame/", "", ref).strip("/")
 
 
 def _is_mesh_asset_path(path: str) -> bool:
@@ -61,12 +82,30 @@ class SceneModelsWorker(CancellableWorker):
     def __init__(self, project_dir, bulk_dir, output_dir,
                  do_scenes, do_models, do_blueprints=False, do_materials=False, strip_prefix=True, unit_scale=1.0,
                  use_graybox_fallback=False, master_shaders=None, master_slot_overrides=None,
-                 master_param_overrides=None,
+                 master_param_overrides=None, master_feature_flags=None, master_blend_modes=None,
                  selected_assets=None, import_lods=True, import_collision=True,
-                 tex_format="tga", invert_y_normal=True, parent=None):
+                 tex_format="tga", invert_y_normal=True,
+                 import_lights=False, import_sky=False, import_cubemaps=False,
+                 import_decals=True, mirror_negative_scale=True, parent=None):
         super().__init__(parent)
         self.import_lods = import_lods
         self.import_collision = import_collision
+        # Map settings — which non-geometry actors a map converts, and whether
+        # handedness-flipped placements get a mirrored copy of their model.
+        self.import_lights = import_lights
+        self.import_sky = import_sky
+        self.import_cubemaps = import_cubemaps
+        self.import_decals = import_decals
+        self.mirror_negative_scale = mirror_negative_scale
+        # (UE mesh, mirror axes) pairs some map placed with a negative scale;
+        # each gets its own mirrored vmdl written in the Models stage.
+        self._mirrored_meshes = set()
+        # UE materials a decal actor referenced. Nothing else pulls these in —
+        # the Materials stage works from the material names inside each mesh's
+        # FBX, and a decal has no mesh — so without collecting them here every
+        # decal-only material goes unconverted and its overlay lands in Hammer
+        # pointing at a vmat that was never written.
+        self._decal_materials = set()
         self.tex_format = tex_format
         self.invert_y_normal = invert_y_normal
         # Asset keys the user picked in the port scope dialog, already expanded
@@ -82,6 +121,8 @@ class SceneModelsWorker(CancellableWorker):
         self.master_shaders = master_shaders or {}
         self.master_slot_overrides = master_slot_overrides or {}
         self.master_param_overrides = master_param_overrides or {}
+        self.master_feature_flags = master_feature_flags or {}
+        self.master_blend_modes = master_blend_modes or {}
         self.project_dir = project_dir
         self.bulk_dir = bulk_dir
         self.output_dir = output_dir
@@ -128,6 +169,33 @@ class SceneModelsWorker(CancellableWorker):
         if self.selected_stems is None or _is_external_ref(key_or_ref):
             return True
         return ref_stem(key_or_ref) in self.selected_stems
+
+    def _mirror_axes_for(self, mesh):
+        """Every distinct mirror-axis set some map placed this mesh with."""
+        return sorted(axes for m, axes in self._mirrored_meshes if m == mesh)
+
+    def _warn_missing_actor_kinds(self, seen_kinds):
+        """Say so when a Map setting is on but the scene read returned nothing
+        it could apply to.
+
+        A bridge built before lights were added reports those actors as nothing
+        at all, so the setting silently does nothing — indistinguishable from a
+        map that genuinely has no lights unless it is called out here.
+        """
+        from .light_entities import LIGHT_COMPONENTS, SKY_COMPONENTS, CUBEMAP_COMPONENTS
+
+        for enabled, kinds, label in (
+            (self.import_lights, LIGHT_COMPONENTS, "lights"),
+            (self.import_sky, SKY_COMPONENTS, "sky"),
+            (self.import_cubemaps, CUBEMAP_COMPONENTS, "cubemaps"),
+        ):
+            if enabled and not (set(kinds) & seen_kinds):
+                self._log(
+                    f"Import {label} is enabled but the scene read returned no such actors. "
+                    f"Either the maps have none, or the CUE4Parse bridge predates this feature "
+                    f"and needs rebuilding (src/net_core/UnrealBridge/README.md).",
+                    "warn",
+                )
 
     def _normalize_landscape_actors(self, actors, map_obj_path):
         """Rewrite dump_scene's "Landscape" actor entries (in place) into ordinary
@@ -186,6 +254,9 @@ class SceneModelsWorker(CancellableWorker):
         if not bridge.is_available():
             self._log("CUE4Parse bridge unavailable — " + bridge.why_unavailable(), "error")
             return
+        # Which dll actually ran is the first thing to check when the bridge
+        # returns something the current source says it should not.
+        self._log(f"Bridge       : {bridge.dll}", "info")
 
         # Discover maps from the project.
         try:
@@ -205,6 +276,7 @@ class SceneModelsWorker(CancellableWorker):
         self._log(f"Found {len(map_keys)} map(s): {', '.join(os.path.basename(m) for m in map_keys)}", "info")
 
         referenced_meshes = set()
+        seen_kinds = set()
 
         # --- Scenes -> vmap ---
         if self.do_scenes:
@@ -223,21 +295,39 @@ class SceneModelsWorker(CancellableWorker):
                     continue
 
                 self._normalize_landscape_actors(scene["actors"], obj)
+                seen_kinds.update(a.get("componentType", "") for a in scene["actors"])
 
                 vmap_path = os.path.join(self.output_dir, "maps", f"{name}.vmap")
-                res = write_vmap(scene["actors"], vmap_path, unit_scale=self.unit_scale, strip_prefix=self.strip_prefix)
+                res = write_vmap(
+                    scene["actors"], vmap_path,
+                    unit_scale=self.unit_scale, strip_prefix=self.strip_prefix,
+                    import_lights=self.import_lights, import_sky=self.import_sky,
+                    import_cubemaps=self.import_cubemaps, import_decals=self.import_decals,
+                    mirror_negative_scale=self.mirror_negative_scale,
+                )
                 referenced_meshes.update(
                     a["mesh"] for a in scene["actors"]
                     if a.get("mesh") and a.get("componentType") == "StaticMeshComponent"
                 )
+                self._mirrored_meshes.update(res.mirrored_meshes)
+                self._decal_materials.update(res.decal_materials)
                 skip_note = ""
                 if res.skipped:
                     skip_note = f" ({res.skipped} skipped: {res.skipped_types})"
-                smartprop_note = f", {res.placed_smartprops} smartprop" if res.placed_smartprops else ""
+                extras = [
+                    (res.placed_smartprops, "smartprop"),
+                    (res.placed_decals, "decal"),
+                    (res.placed_lights, "light"),
+                    (res.placed_sky, "sky"),
+                    (res.placed_cubemaps, "cubemap"),
+                    (len(res.mirrored_meshes), "mirrored model"),
+                ]
+                extra_note = "".join(f", {n} {label}" for n, label in extras if n)
                 self._log(
-                    f"{name}.vmap — {res.placed} prop_static{smartprop_note}, {len(res.models)} models{skip_note}",
+                    f"{name}.vmap — {res.placed} prop_static{extra_note}, {len(res.models)} models{skip_note}",
                     "success",
                 )
+            self._warn_missing_actor_kinds(seen_kinds)
         else:
             # Models-only still needs the mesh list; pull it from the maps.
             for i, mk in enumerate(map_keys):
@@ -309,7 +399,17 @@ class SceneModelsWorker(CancellableWorker):
 
                     clean_bp_name = strip_ue_prefix(name) if self.strip_prefix else name
                     vsmart_path = os.path.join(self.output_dir, "smartprops", f"{clean_bp_name.lower()}.vsmart")
-                    res = write_vsmart(clean_bp_name, components, vsmart_path, unit_scale=self.unit_scale, strip_prefix=self.strip_prefix)
+                    variables = bp_data.get("variables", [])
+                    choices = bp_data.get("choices", [])
+                    res = write_vsmart(
+                        clean_bp_name,
+                        components,
+                        vsmart_path,
+                        unit_scale=self.unit_scale,
+                        strip_prefix=self.strip_prefix,
+                        variables=variables,
+                        choices=choices,
+                    )
                     if res.placed > 0:
                         referenced_meshes.update(res.models)
                         bp_count += 1
@@ -348,7 +448,7 @@ class SceneModelsWorker(CancellableWorker):
             self._log(f"Referenced meshes found: {len(referenced_meshes)}", "info")
             if not referenced_meshes:
                 self._log("No referenced meshes to build vmdls for. Make sure Scenes is enabled or at least one map was scanned.", "warn")
-            made, missing, engine, landscapes = 0, 0, 0, 0
+            made, missing, engine, landscapes, mirrored = 0, 0, 0, 0, 0
             total = len(referenced_meshes)
             for i, mesh in enumerate(sorted(referenced_meshes)):
                 if self._cancel_check():
@@ -415,11 +515,26 @@ class SceneModelsWorker(CancellableWorker):
                            use_graybox_fallback=self.use_graybox_fallback)
                 made += 1
 
+                # A map placed this mesh with a handedness-flipping scale, so it
+                # also needs the mirrored twin(s) the vmap now references — one
+                # per distinct axis set. All reference the same FBX; the mirror
+                # is a ModelDoc modifier, so no second mesh is exported.
+                for axes in self._mirror_axes_for(mesh):
+                    self._write_vmdl(os.path.join(self.output_dir, mirrored_model_path(model_rel, axes)),
+                               mesh_rel, import_scale=self.unit_scale,
+                               fbx_path=dst_fbx or src_fbx, material_path=mat_rel,
+                               output_dir=self.output_dir,
+                               use_graybox_fallback=self.use_graybox_fallback, mirror_axes=axes)
+                    mirrored += 1
+                    made += 1
+
             parts = [f"{made} vmdl written"]
             if engine:
                 parts.append(f"{engine} engine primitive(s) generated")
             if landscapes:
                 parts.append(f"{landscapes} landscape mesh(es) exported")
+            if mirrored:
+                parts.append(f"{mirrored} mirrored copy(ies)")
             level = "success" if missing == 0 else "warn"
             tail = f" ({missing} without a bulk-export FBX — vmdl references a missing mesh)" if missing else ""
             self._log("Models — " + ", ".join(parts) + tail, level)
@@ -455,14 +570,40 @@ class SceneModelsWorker(CancellableWorker):
                 for m in (list_materials(src) or []):
                     wanted.add(m.lower())
 
+        # A decal's material is attached to the actor, not to any mesh, so it
+        # never appears in an FBX and the loop above cannot see it. Its exact
+        # object path is known, so it is registered directly rather than hoping
+        # list_materials' name/folder heuristic recognised it — decal materials
+        # routinely sit in a Decals/ folder under a D_ prefix, which it does not.
+        for ue_mat in self._decal_materials:
+            key = _object_path_to_key(ue_mat)
+            if key:
+                stem = key.rsplit("/", 1)[-1].lower()
+                stem_to_path.setdefault(stem, key)
+                wanted.add(stem)
+
         targets = [(s, p) for s, p in stem_to_path.items() if s in wanted]
         if not targets:
             self._log("Materials — no matching material instances for the scene meshes.", "info")
             return
 
-        from .converter import predict_cs2_shader, get_master_material_name
+        from .converter import (
+            FALLBACK_SHADER, get_master_material_name, load_material_swaps_kv3,
+            seed_shader_for, save_material_swaps_kv3,
+        )
+
+        kv3_swaps, kv3_slots, kv3_params, kv3_flags, kv3_blend = load_material_swaps_kv3(self.output_dir)
+        merged_shaders = dict(kv3_swaps)
+        if self.master_shaders:
+            merged_shaders.update(self.master_shaders)
 
         done, missing_tex = 0, 0
+        unmapped = set()
+        self._log(
+            f"Materials — {len(targets)} to convert; remap table has "
+            f"{len(merged_shaders)} Master Material(s).",
+            "info",
+        )
         for i, (stem, path) in enumerate(sorted(targets)):
             if self._cancel_check():
                 return
@@ -470,20 +611,53 @@ class SceneModelsWorker(CancellableWorker):
             try:
                 data = self.bridge.dump_material(path)
                 master_name = get_master_material_name(data, path)
-                # The Materials tab's choice for this Master Material wins; the
-                # name heuristic is only a fallback for masters the scan never
-                # saw (e.g. Convert run without a preceding Scan).
-                shader = self.master_shaders.get(master_name) or predict_cs2_shader(master_name, data.get("flags"))
-                overrides = self.master_slot_overrides.get(master_name) or slot_overrides
-                param_overrides = self.master_param_overrides.get(master_name) or {}
+                shader = merged_shaders.get(master_name)
+                if not shader:
+                    shader = seed_shader_for(master_name, data.get("flags"))
+                    merged_shaders[master_name] = shader
+                    save_material_swaps_kv3(self.output_dir, merged_shaders,
+                                            slot_mappings=self.master_slot_overrides or kv3_slots,
+                                            param_mappings=self.master_param_overrides or kv3_params,
+                                            feature_flags=self.master_feature_flags or kv3_flags,
+                                            blend_modes=self.master_blend_modes or kv3_blend)
+                    source = f"stamped & mapped {master_name}"
+                else:
+                    source = f"remap of {master_name}"
+
+                extras = []
+                overrides = (self.master_slot_overrides.get(master_name)
+                             if self.master_slot_overrides and master_name in self.master_slot_overrides
+                             else kv3_slots.get(master_name, slot_overrides))
+                param_overrides = (self.master_param_overrides.get(master_name)
+                                   if self.master_param_overrides and master_name in self.master_param_overrides
+                                   else kv3_params.get(master_name, {}))
+                feature_flags = (self.master_feature_flags.get(master_name)
+                                 if self.master_feature_flags and master_name in self.master_feature_flags
+                                 else kv3_flags.get(master_name, {}))
+                blend_mode = (self.master_blend_modes.get(master_name)
+                              if self.master_blend_modes and master_name in self.master_blend_modes
+                              else kv3_blend.get(master_name, 0))
+
+                if overrides:
+                    extras.append(f"{len(overrides)} slot")
+                if param_overrides:
+                    extras.append(f"{len(param_overrides)} param")
+                if feature_flags:
+                    extras.append(f"{len(feature_flags)} feature")
+                if blend_mode:
+                    extras.append(f"blend mode {blend_mode}")
+                if extras:
+                    source += " + " + "/".join(extras)
+
                 res = convert_material(data, self.bulk_dir, self.output_dir,
                                        shader=shader, slot_overrides=overrides,
                                        param_overrides=param_overrides,
                                        strip_prefix=self.strip_prefix,
                                        tex_format=self.tex_format,
-                                       invert_y_normal=self.invert_y_normal)
+                                       invert_y_normal=self.invert_y_normal,
+                                       feature_flags=feature_flags, blend_mode=blend_mode)
                 done += 1
-                msg = f"  material {stem}: Success ({shader})"
+                msg = f"  material {stem}: Success ({shader}, {source})"
                 if res.missing:
                     missing_tex += 1
                     msg += f" (missing: {', '.join(res.missing)})"
@@ -492,6 +666,16 @@ class SceneModelsWorker(CancellableWorker):
                 self._log(f"  material {stem}: {e}", "warn")
         note = f", {missing_tex} with missing textures" if missing_tex else ""
         self._log(f"Materials — {done} vmat written{note}", "success")
+        if unmapped:
+            # A gap in the saved table, not a conversion failure — but the shader
+            # these got was a fallback constant, not a choice, so say so.
+            self._log(
+                f"Materials — {len(unmapped)} Master Material(s) have no shader remap entry "
+                f"and converted with the {FALLBACK_SHADER} fallback. Re-analyze the project "
+                f"to give them one, then set it in the Materials tab: "
+                + ", ".join(sorted(unmapped)),
+                "warn",
+            )
 
     def _build_landscape_model(self, mesh_id, vmdl_path, model_rel, mat_rel) -> bool:
         """Build the landscape's vmdl from a bulk-exported FBX if the user has
@@ -567,6 +751,28 @@ def demo():
     unscoped = SceneModelsWorker.__new__(SceneModelsWorker)
     unscoped.selected_stems = None
     assert unscoped._wanted("/Game/Meshes/SM_Table.SM_Table")
+
+    # A decal's material arrives as a UE object path; the bridge addresses
+    # packages by their key. Passing the object path through unconverted fails
+    # with "there is no game file with the path", which is how every decal-only
+    # material went unconverted and left its overlay pointing at nothing.
+    assert _object_path_to_key("/Game/Kowloon/Meshes/Decals/D_Dirt_01.D_Dirt_01") \
+        == "Kowloon/Meshes/Decals/D_Dirt_01"
+    assert _object_path_to_key("MaterialInstanceConstant'/Game/M/MI_A.MI_A'") == "M/MI_A"
+    assert _object_path_to_key("/Game/A.A") == "A"
+    assert _object_path_to_key("") == ""
+
+    # One mesh mirrored on different axes in different places needs one vmdl
+    # each; a repeat of the same axis set must not write the file twice.
+    w = SceneModelsWorker.__new__(SceneModelsWorker)
+    w._mirrored_meshes = {
+        ("/Game/M/SM_A.SM_A", (True, False, False)),
+        ("/Game/M/SM_A.SM_A", (False, False, True)),
+        ("/Game/M/SM_B.SM_B", (True, False, False)),
+    }
+    assert w._mirror_axes_for("/Game/M/SM_A.SM_A") == [(False, False, True), (True, False, False)]
+    assert w._mirror_axes_for("/Game/M/SM_B.SM_B") == [(True, False, False)]
+    assert w._mirror_axes_for("/Game/M/SM_C.SM_C") == []
 
     print("ok")
 
