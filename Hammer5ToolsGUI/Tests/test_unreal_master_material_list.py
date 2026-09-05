@@ -30,9 +30,12 @@ def test_material_group_filters_match_instances_textures_and_selection():
     assert material_group_matches(info, "M_Master", "master material_12")
     assert material_group_matches(info, "M_Master", "textures/t_material_12")
     assert not material_group_matches(info, "M_Master", "missing")
-    assert material_group_is_selected(info, "M_Master", {"mi_material_12"})
-    assert material_group_is_selected(info, "M_Master", {"m_master"})
-    assert not material_group_is_selected(info, "M_Master", {"mi_material_4"})
+    # The scope is a set of asset paths: a bare name would mark every pack's
+    # same-named material as picked.
+    assert material_group_is_selected(info, "M_Master", {"materials/mi_material_12"})
+    assert material_group_is_selected(info, "M_Master", {"materials/m_master"})
+    assert not material_group_is_selected(info, "M_Master", {"materials/mi_material_4"})
+    assert not material_group_is_selected(info, "M_Master", {"otherpack/materials/mi_material_12"})
 
 
 def test_material_list_only_creates_widgets_near_the_viewport():

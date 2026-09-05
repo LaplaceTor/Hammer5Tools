@@ -6,6 +6,7 @@ point. expand_references walks the actual asset data through the CUE4Parse
 bridge and adds everything the chosen assets point at, transitively.
 """
 import os
+import re
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QUndoStack
@@ -124,6 +125,34 @@ def ref_stem(ref: str) -> str:
     return tail.split(".", 1)[0].lower()
 
 
+def asset_path_key(value) -> str:
+    """One asset's identity, as a lowercased content path with no extension and
+    no object suffix: "kitedemo/maps/overview".
+
+    Takes either a file key ("KiteDemo/Maps/Overview.umap", "Proj/Content/…") or
+    a UE object reference ("StaticMesh'/Game/KiteDemo/SM_Rock.SM_Rock'") and
+    lands both on the same string, so a port scope built from picked files can
+    be tested against a reference read out of a map.
+
+    Basenames are not identities. A project routinely holds a dozen
+    Overview.umap and as many SM_Rock.uasset in different packs; scoping on the
+    basename ported 14 maps for 1 pick, and resolving on it hands back whichever
+    same-named asset happened to be indexed first.
+    """
+    text = str(value).replace("\\", "/").strip()
+    if "'" in text:
+        quoted = re.search(r"'(.*?)'", text)
+        if quoted:
+            text = quoted.group(1)
+    if os.path.splitext(text)[1].lower() in (".uasset", ".umap"):
+        text = key_to_object_path(text)
+    head, _, tail = text.rpartition("/")
+    path = f"{head}/{tail.split('.', 1)[0]}".strip("/")
+    if path.lower().startswith("game/"):
+        path = path[len("game/"):]
+    return path.lower()
+
+
 def key_to_object_path(key: str) -> str:
     """File key -> the UE object path the converters expect.
 
@@ -143,9 +172,49 @@ def key_to_object_path(key: str) -> str:
 
 
 def _index_by_stem(keys) -> dict:
+    """{basename: [keys]} — a list, not one key. Two packs holding their own
+    SM_Rock are two different assets, and keeping only the first meant a map
+    that referenced the second silently resolved to the first: its own mesh
+    never entered the port scope and so never got exported."""
     index = {}
     for key in keys:
-        index.setdefault(asset_stem(key), key)
+        index.setdefault(asset_stem(key), []).append(key)
+    return index
+
+
+def _index_by_path(keys) -> dict:
+    return {asset_path_key(key): key for key in keys}
+
+
+# World Partition keeps each actor in its own package under these roots instead
+# of inside the .umap.
+_EXTERNAL_ACTOR_ROOTS = ("__externalactors__", "__externalobjects__")
+
+
+def _external_actor_index(all_keys) -> dict:
+    """{map path key: [its external actor keys]}.
+
+    A World Partition map imports none of its actors — they live in
+    __ExternalActors__/<map path>/…, one package each — so scanning the .umap
+    for references reports almost nothing, and the meshes those actors place
+    never reach the port scope or the exporter. That is what left 19 models
+    pointing at an FBX nobody exported while "272 picked" pulled in 5.
+    """
+    map_paths = {asset_path_key(k) for k in all_keys if str(k).lower().endswith(".umap")}
+    index = {}
+    for key in all_keys:
+        path = asset_path_key(key)
+        root, _, rest = path.partition("/")
+        if root not in _EXTERNAL_ACTOR_ROOTS or not rest:
+            continue
+        # The actor sits under <map path>/<hash>/<hash>/<name>; the map path is
+        # the longest prefix of that which names a real map.
+        parts = rest.split("/")
+        for cut in range(len(parts) - 1, 0, -1):
+            candidate = "/".join(parts[:cut])
+            if candidate in map_paths:
+                index.setdefault(candidate, []).append(key)
+                break
     return index
 
 
@@ -182,8 +251,20 @@ def expand_references(bridge, keys, all_keys, log_cb=None, progress_cb=None, max
             log_cb(msg, level)
 
     index = _index_by_stem(all_keys)
-    selected = set(keys)
-    pending = set(keys)
+    by_path = _index_by_path(all_keys)
+    external_actors = _external_actor_index(all_keys)
+
+    def with_external_actors(chosen) -> set:
+        """Every picked World Partition map, plus the actor packages that hold
+        what it places — the map alone references none of them."""
+        extra = set()
+        for key in chosen:
+            if str(key).lower().endswith(".umap"):
+                extra.update(external_actors.get(asset_path_key(key), ()))
+        return extra - set(chosen)
+
+    selected = set(keys) | with_external_actors(keys)
+    pending = set(selected)
     added_total = 0
     unreadable = []
 
@@ -191,19 +272,27 @@ def expand_references(bridge, keys, all_keys, log_cb=None, progress_cb=None, max
         new_refs = {}
 
     def resolve_stem(ref_str: str) -> set:
+        # A reference names a full path, so use it: the exact asset it points at,
+        # not whichever same-named one is first in the listing.
+        exact = by_path.get(asset_path_key(ref_str))
+        if exact:
+            return {exact}
         st = ref_stem(ref_str)
         if not st:
             return set()
+        # No exact hit: the reference is to content outside the listing, or the
+        # naming-convention guesses below. Same-named candidates all come along —
+        # over-including a duplicate costs an export, dropping the real one costs
+        # a missing mesh.
         if st in index:
-            return {index[st]}
+            return set(index[st])
         matches = set()
         candidates = (
             f"mi_{st}", f"mi_{st}_01", f"mi_{st}_01a", f"mi_{st}a",
             f"m_{st}", f"m_{st}_01", f"mat_{st}", f"mat_{st}_01",
         )
         for cand in candidates:
-            if cand in index:
-                matches.add(index[cand])
+            matches.update(index.get(cand, ()))
         return matches
 
     def scan(key):
@@ -257,6 +346,7 @@ def expand_references(bridge, keys, all_keys, log_cb=None, progress_cb=None, max
                 new_refs[key] = hits
                 discovered.update(hits)
 
+        discovered |= with_external_actors(discovered)
         discovered -= selected
         selected |= discovered
         added_total += len(discovered)
@@ -469,17 +559,12 @@ def demo():
     assert key_to_object_path("Content/A/B.uasset") == "/Game/A/B.B"
     assert ref_stem(key_to_object_path(keys[1])) == asset_stem(keys[1])
 
-    # The scan reads a dump as text rather than parsing it, so the pattern that
-    # picks references out of it is what the whole expansion hangs on.
-    from .bridge_client import _REF_FIELD
-    found = set(_REF_FIELD.findall(
-        '  "StaticMaterials": [\n'
-        '    {\n'
-        '      "MaterialInterface": {\n'
-        '        "ObjectName": "MaterialInstanceConstant\'MI_Wood\'",\n'
-        '        "ObjectPath": "/Game/Materials/MI_Wood.MI_Wood"\n'
-    ))
-    assert {"MaterialInstanceConstant'MI_Wood'", "/Game/Materials/MI_Wood.MI_Wood"}.issubset(found), found
+    # A file key and every form of the reference that names it are one identity,
+    # and it is the path — basenames repeat across packs by the hundred.
+    assert asset_path_key(keys[1]) == "meshes/sm_chair"
+    assert asset_path_key("/Game/Meshes/SM_Chair.SM_Chair") == "meshes/sm_chair"
+    assert asset_path_key("StaticMesh'/Game/Meshes/SM_Chair.SM_Chair'") == "meshes/sm_chair"
+    assert asset_path_key("A/Maps/Overview.umap") != asset_path_key("B/Maps/Overview.umap")
 
     class FakeBridge:
         """Arena -> SM_Chair -> MI_Wood -> T_Wood_D, one hop per dump."""
@@ -523,6 +608,38 @@ def demo():
     broken = {}
     expand_references(BrokenBridge(), {keys[0]}, keys, new_refs=broken)
     assert broken == {keys[0]: []}, broken
+
+    # A World Partition map imports none of its actors, so picking the map has
+    # to bring in its __ExternalActors__ packages — and through them the meshes
+    # they place, which nothing else would ever queue for export.
+    wp_keys = [
+        "P/Content/Maps/City.umap",
+        "P/Content/__ExternalActors__/Maps/City/A/BC/ACTOR1.uasset",
+        "P/Content/Meshes/SM_Tower.uasset",
+    ]
+
+    class WpBridge:
+        def iter_refs(self, obj, is_cancelled=None):
+            if obj.endswith("ACTOR1"):
+                return {"/Game/Meshes/SM_Tower.SM_Tower"}
+            return set()
+
+    assert expand_references(WpBridge(), {wp_keys[0]}, wp_keys) == set(wp_keys)
+
+    # Two packs' same-named meshes are two assets: a reference resolves to the
+    # one it actually names, not to whichever was listed first.
+    dupes = ["KiteDemo/Meshes/SM_Rock.uasset", "Poplar/Meshes/SM_Rock.uasset"]
+    assert _index_by_path(dupes) == {
+        "kitedemo/meshes/sm_rock": dupes[0], "poplar/meshes/sm_rock": dupes[1],
+    }
+    assert len(_index_by_stem(dupes)["sm_rock"]) == 2
+
+    class RockBridge:
+        def iter_refs(self, obj, is_cancelled=None):
+            return {"/Game/Poplar/Meshes/SM_Rock.SM_Rock"} if obj.endswith("Map") else set()
+
+    rock_keys = dupes + ["Poplar/Maps/Map.umap"]
+    assert expand_references(RockBridge(), {rock_keys[2]}, rock_keys) == {rock_keys[2], dupes[1]}
 
     # Classification drives both the stats line and the type filter, so a
     # misread prefix silently hides assets from the port.

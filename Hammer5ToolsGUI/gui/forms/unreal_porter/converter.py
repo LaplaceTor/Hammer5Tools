@@ -231,6 +231,18 @@ class MaterialConvertWorker(QThread):
 # material — just a definite, stated default.
 FALLBACK_SHADER = "csgo_environment.vfx"
 
+# UE blend modes that put a material somewhere other than the opaque pass.
+_TRANSLUCENT_BLENDS = (
+    "BLEND_Translucent", "BLEND_Additive", "BLEND_Modulate",
+    "BLEND_AlphaComposite", "BLEND_AlphaHoldout",
+)
+
+# Material domains with no CS2 surface-shader equivalent at all. They are still
+# seeded (every master needs a row in the remap table) but reported, because a
+# post-process or light-function material converted as environment geometry is
+# not something the user asked for.
+UNPORTABLE_DOMAINS = ("MD_PostProcess", "MD_UI", "MD_LightFunction", "MD_Volume")
+
 
 def seed_shader_for(master_name: str, mat_flags: dict = None) -> str:
     """The shader a *newly discovered* Master Material starts out mapped to.
@@ -247,9 +259,27 @@ def seed_shader_for(master_name: str, mat_flags: dict = None) -> str:
     """
     name_lower = master_name.lower()
     flags = mat_flags or {}
-    domain = flags.get("domain", "")
+    domain = flags.get("domain") or ""
+    blend = flags.get("blendMode") or ""
+    shading = flags.get("shadingModel") or ""
 
-    if domain == "MD_DeferredDecal" or "decal" in name_lower or "overlay" in name_lower:
+    # What the material says about itself beats what it is called. A project's
+    # foliage is named M_shrub / M_Yarrow_Inst / M_FieldScabious_01 as often as
+    # M_Grass, and the name rules below saw none of those — yet every one is
+    # masked MSM_TwoSidedFoliage in the asset. Names stay as the fallback for
+    # masters whose flags come back empty.
+    if domain == "MD_DeferredDecal" or flags.get("decalBlendMode"):
+        return "csgo_static_overlay.vfx"
+    if shading == "MSM_TwoSidedFoliage" or (blend == "BLEND_Masked" and shading == "MSM_Subsurface"):
+        return "csgo_foliage.vfx"
+    if blend in _TRANSLUCENT_BLENDS:
+        # Unlit translucency is a glow card, beam or particle sheet; lit
+        # translucency is glass. Additive is never glass.
+        if blend == "BLEND_Additive" or shading == "MSM_Unlit":
+            return "csgo_effects.vfx"
+        return "csgo_glass.vfx"
+
+    if "decal" in name_lower or "overlay" in name_lower:
         return "csgo_static_overlay.vfx"
     if any(k in name_lower for k in ("foliage", "leaf", "leaves", "grass", "tree", "plant", "vegetation", "bark")):
         return "csgo_foliage.vfx"
@@ -490,6 +520,8 @@ def scan_master_materials(project_dir: str, bulk_dir: str = None, bridge=None, o
     # Masters that had no saved entry and got one seeded this scan. Reported and
     # persisted below, so the saved table is complete before any conversion runs.
     seeded = {}
+    non_materials = 0
+    unportable = []
     if output_dir:
         res = load_material_swaps_kv3(output_dir)
         saved_swaps, saved_slot_mappings, saved_param_mappings = res[0], res[1], res[2]
@@ -529,6 +561,17 @@ def scan_master_materials(project_dir: str, bulk_dir: str = None, bridge=None, o
                             log_cb(f"  Skipped {os.path.basename(path)}: {error}", "warn")
                         continue
 
+                    # list_materials() selects by folder and filename, so it also
+                    # hands over MaterialFunctions, parameter collections, curves,
+                    # textures and (via the "MM_" prefix) animation sequences. Only
+                    # a package holding a Material / MaterialInstance export
+                    # resolves flags, so a null there means "not a material" —
+                    # without this every MF_*/MPC_*/T_* became its own Master
+                    # Material with a name-guessed shader.
+                    if mat_data.get("flags") is None:
+                        non_materials += 1
+                        continue
+
                     master_name = get_master_material_name(mat_data, path)
                     stem = os.path.basename(path)
                     if master_name not in groups:
@@ -545,6 +588,8 @@ def scan_master_materials(project_dir: str, bulk_dir: str = None, bridge=None, o
                             "feature_flags": saved_feature_flags.get(master_name, {}),
                             "blend_mode": saved_blend_modes.get(master_name, 0),
                         }
+                        if (mat_data.get("flags") or {}).get("domain") in UNPORTABLE_DOMAINS:
+                            unportable.append((master_name, mat_data["flags"]["domain"]))
                         if log_cb:
                             log_cb(f"Discovered Master Material: {master_name} (target CS2 shader: {shader})", "info")
 
@@ -552,6 +597,14 @@ def scan_master_materials(project_dir: str, bulk_dir: str = None, bridge=None, o
                     for p_name, p_path in (mat_data.get("textures") or {}).items():
                         if p_name not in groups[master_name]["textures"]:
                             groups[master_name]["textures"][p_name] = p_path
+
+            if non_materials and log_cb:
+                log_cb(f"Skipped {non_materials} asset(s) that are not materials "
+                       "(material functions, parameter collections, curves, textures, animations).", "info")
+            if unportable and log_cb:
+                listed = ", ".join(f"{n} ({d})" for n, d in sorted(unportable))
+                log_cb(f"{len(unportable)} Master Material(s) have a domain with no CS2 equivalent "
+                       f"and are seeded to {FALLBACK_SHADER} — review or deselect them: {listed}", "warn")
         except Exception as e:
             if log_cb:
                 log_cb(f"Bridge material scan failed: {e}", "error")

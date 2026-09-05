@@ -49,14 +49,21 @@ def material_group_matches(info: dict, master_name: str, search_text: str) -> bo
     return all(term in haystack for term in terms)
 
 
-def material_group_is_selected(info: dict, master_name: str, selected_stems: set[str]) -> bool:
-    """Whether the master or one of its instances is in the current port scope."""
-    if not selected_stems:
+def material_group_is_selected(info: dict, master_name: str, selected_paths: set[str]) -> bool:
+    """Whether the master or one of its instances is in the current port scope.
+
+    Instances are matched on their path — a name match would show every pack's
+    same-named material as picked. The master itself is only ever a name, so it
+    still matches by name."""
+    from .asset_selection import asset_path_key
+
+    if not selected_paths:
         return False
-    if os.path.splitext(os.path.basename(master_name))[0].casefold() in selected_stems:
+    master_stem = os.path.splitext(os.path.basename(master_name))[0].casefold()
+    if any(master_stem == path.rsplit("/", 1)[-1] for path in selected_paths):
         return True
-    return any(str(stem).casefold() in selected_stems
-               for stem, _path, _data in info.get("instances", []))
+    return any(asset_path_key(path) in selected_paths
+               for _stem, path, _data in info.get("instances", []))
 
 
 def describe_bindings(textures: dict, slot_overrides: dict = None, shader: str = None, info: dict = None) -> str:
@@ -268,7 +275,7 @@ class MasterMaterialList(QScrollArea):
         self._entry_ends = []
         self._search_text = ""
         self._selected_only = False
-        self._selected_stems = set()
+        self._selected_paths = set()
         self._rebuilding = False
         self._materializing = False
 
@@ -313,11 +320,11 @@ class MasterMaterialList(QScrollArea):
 
     def set_filters(self, search_text: str = "", selected_only: bool = False,
                     selected_assets=()) -> None:
-        from .asset_selection import asset_stem
+        from .asset_selection import asset_path_key
 
         self._search_text = search_text.strip()
         self._selected_only = selected_only
-        self._selected_stems = {asset_stem(asset) for asset in selected_assets}
+        self._selected_paths = {asset_path_key(asset) for asset in selected_assets}
         self._rebuild_entries()
 
     def _rebuild_entries(self):
@@ -328,7 +335,7 @@ class MasterMaterialList(QScrollArea):
                 (name, info) for name, info in self._master_groups.items()
                 if material_group_matches(info, name, self._search_text)
                 and (not self._selected_only
-                     or material_group_is_selected(info, name, self._selected_stems))
+                     or material_group_is_selected(info, name, self._selected_paths))
             ]
             sorted_groups = sorted(
                 visible_groups,

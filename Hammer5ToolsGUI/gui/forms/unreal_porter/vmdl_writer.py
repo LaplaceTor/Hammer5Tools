@@ -125,8 +125,11 @@ def mirrored_model_path(model_path: str, mirror_axes) -> str:
     return f"{model_path[:-5]}_mirror_{suffix}.vmdl"
 
 
+_MESH_EXTS = (".fbx", ".obj", ".gltf", ".glb", ".dmx")
+
+
 def find_bulk_export_mesh(bulk_dir: str, ue_mesh_path: str):
-    """Locate the bulk-exported mesh file for a UE mesh ref by asset stem."""
+    """Locate the bulk-exported mesh file for a UE mesh ref, by path then name."""
     if not bulk_dir or not os.path.exists(bulk_dir):
         return None
 
@@ -139,6 +142,17 @@ def find_bulk_export_mesh(bulk_dir: str, ue_mesh_path: str):
     clean_path = ue_mesh_path.replace("\\", "/")
     if clean_path.lower().endswith(".vmdl"):
         clean_path = clean_path[:-5]
+
+    # The exporter mirrors the UE package path, so the mesh's own path is an
+    # exact answer. The name walk below is the fallback, and it cannot tell two
+    # packs' SM_Rock apart — it returns whichever it reaches first.
+    head, _, tail = clean_path.rpartition("/")
+    package = f"{head}/{tail.split('.', 1)[0]}".strip("/")
+    if package:
+        for ext in _MESH_EXTS:
+            exact = os.path.join(bulk_dir, *package.split("/")) + ext
+            if os.path.isfile(exact):
+                return exact
 
     stem = clean_path.split(".", 1)[0].rstrip("/").rsplit("/", 1)[-1].lower()
     stripped_stem = strip_ue_prefix(stem)

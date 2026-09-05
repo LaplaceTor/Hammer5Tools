@@ -9,7 +9,7 @@ import re
 import shutil
 from PySide6.QtCore import QThread, Signal
 
-from .asset_selection import asset_stem, ref_stem, key_to_object_path
+from .asset_selection import asset_path_key, ref_stem, key_to_object_path
 from ._worker_base import CancellableWorker
 from .bridge_client import UnrealBridge, BridgeError
 from .vmap_writer import write_vmap
@@ -63,6 +63,12 @@ def _object_path_to_key(ue_object_path: str) -> str:
     return re.sub(r"^/?[Gg]ame/", "", ref).strip("/")
 
 
+def _map_rel_path(ue_object_path: str) -> str:
+    """"/Game/KiteDemo/Maps/Overview" -> "kitedemo/maps/overview.vmap"."""
+    p = re.sub(r"^/?[Gg]ame/", "", ue_object_path.replace("\\", "/").strip("/"))
+    return f"{p or 'map'}.vmap".lower()
+
+
 def _is_mesh_asset_path(path: str) -> bool:
     if not path:
         return False
@@ -114,8 +120,8 @@ class SceneModelsWorker(CancellableWorker):
         self.max_texture_size = max_texture_size
         # Asset keys the user picked in the port scope dialog, already expanded
         # with their references. None means no filtering — port everything.
-        self.selected_stems = (
-            {asset_stem(k) for k in selected_assets} if selected_assets else None
+        self.selected_paths = (
+            {asset_path_key(k) for k in selected_assets} if selected_assets else None
         )
         self.selected_assets = list(selected_assets or ())
         # {master material name: chosen CS2 shader / slot / param overrides}
@@ -174,10 +180,13 @@ class SceneModelsWorker(CancellableWorker):
         template map floor, a BasicShape) or a synthetic landscape id can never
         match it — filtering them meant the vmap placed a prop whose vmdl was
         then silently never written.
+
+        Matching is on the asset's path: on its basename, picking one of this
+        project's 14 Overview.umap put all 14 in scope.
         """
-        if self.selected_stems is None or _is_external_ref(key_or_ref):
+        if self.selected_paths is None or _is_external_ref(key_or_ref):
             return True
-        return ref_stem(key_or_ref) in self.selected_stems
+        return asset_path_key(key_or_ref) in self.selected_paths
 
     def _mirror_axes_for(self, mesh):
         """Every distinct mirror-axis set some map placed this mesh with."""
@@ -273,10 +282,10 @@ class SceneModelsWorker(CancellableWorker):
             self._log(str(e), "error")
             return False
 
-        if self.selected_stems is not None:
+        if self.selected_paths is not None:
             in_scope = [k for k in map_keys if self._wanted(k)]
             self._log(
-                f"Port scope: {len(self.selected_stems)} asset(s); "
+                f"Port scope: {len(self.selected_paths)} asset(s); "
                 f"{len(in_scope)} of {len(map_keys)} map(s) included.", "info",
             )
             map_keys = in_scope
@@ -305,14 +314,24 @@ class SceneModelsWorker(CancellableWorker):
                 self._normalize_landscape_actors(scene["actors"], obj)
                 seen_kinds.update(a.get("componentType", "") for a in scene["actors"])
 
-                vmap_path = os.path.join(self.output_dir, "maps", f"{name}.vmap")
-                res = write_vmap(
-                    scene["actors"], vmap_path,
-                    unit_scale=self.unit_scale, strip_prefix=self.strip_prefix,
-                    import_lights=self.import_lights, import_sky=self.import_sky,
-                    import_cubemaps=self.import_cubemaps, import_decals=self.import_decals,
-                    mirror_negative_scale=self.mirror_negative_scale,
-                )
+                # Keep the UE folder structure, like models/ and materials/ do:
+                # a project with nine Maps/Overview.umap under different content
+                # packs would otherwise write nine times over one maps/Overview.vmap.
+                map_rel = _map_rel_path(obj)
+                vmap_path = os.path.join(self.output_dir, "maps", *map_rel.split("/"))
+                try:
+                    res = write_vmap(
+                        scene["actors"], vmap_path,
+                        unit_scale=self.unit_scale, strip_prefix=self.strip_prefix,
+                        import_lights=self.import_lights, import_sky=self.import_sky,
+                        import_cubemaps=self.import_cubemaps, import_decals=self.import_decals,
+                        mirror_negative_scale=self.mirror_negative_scale,
+                    )
+                except Exception as e:
+                    # One unwritable vmap (Hammer holding the file open) must not
+                    # take the models, materials and blueprints down with it.
+                    self._log(f"{map_rel}: write failed — {e}", "error")
+                    continue
                 referenced_meshes.update(
                     a["mesh"] for a in scene["actors"]
                     if a.get("mesh") and a.get("componentType") == "StaticMeshComponent"
@@ -332,7 +351,7 @@ class SceneModelsWorker(CancellableWorker):
                 ]
                 extra_note = "".join(f", {n} {label}" for n, label in extras if n)
                 self._log(
-                    f"{name}.vmap — {res.placed} prop_static{extra_note}, {len(res.models)} models{skip_note}",
+                    f"{map_rel} — {res.placed} prop_static{extra_note}, {len(res.models)} models{skip_note}",
                     "success",
                 )
             self._warn_missing_actor_kinds(seen_kinds)
@@ -434,7 +453,7 @@ class SceneModelsWorker(CancellableWorker):
         # set when _convert_materials reads their FBX material names, or the
         # "no matching material instances" path fires and the materials that
         # every selected mesh actually uses never get converted.
-        if self.selected_stems is not None:
+        if self.selected_paths is not None:
             # Drop meshes the maps reference but the user left unticked...
             referenced_meshes = {m for m in referenced_meshes if self._wanted(m)}
             # ...and add meshes picked directly, which no map places. UE
@@ -754,13 +773,13 @@ def demo():
     assert not _is_external_ref("MyProj/Content/Meshes/SM_Chair.uasset")
 
     scoped = SceneModelsWorker.__new__(SceneModelsWorker)
-    scoped.selected_stems = {"sm_chair"}
+    scoped.selected_paths = {"meshes/sm_chair"}
     assert scoped._wanted("/Game/Meshes/SM_Chair.SM_Chair")
     assert not scoped._wanted("/Game/Meshes/SM_Table.SM_Table")
     assert scoped._wanted("/Engine/MapTemplates/SM_Template_Map_Floor.SM_Template_Map_Floor")
 
     unscoped = SceneModelsWorker.__new__(SceneModelsWorker)
-    unscoped.selected_stems = None
+    unscoped.selected_paths = None
     assert unscoped._wanted("/Game/Meshes/SM_Table.SM_Table")
 
     # A decal's material arrives as a UE object path; the bridge addresses
@@ -784,6 +803,12 @@ def demo():
     assert w._mirror_axes_for("/Game/M/SM_A.SM_A") == [(False, False, True), (True, False, False)]
     assert w._mirror_axes_for("/Game/M/SM_B.SM_B") == [(True, False, False)]
     assert w._mirror_axes_for("/Game/M/SM_C.SM_C") == []
+
+    # Maps keep their UE folder, or every "Maps/Overview" in the project
+    # overwrites the same maps/Overview.vmap and only the last one survives.
+    assert _map_rel_path("/Game/KiteDemo/Maps/Overview") == "kitedemo/maps/overview.vmap"
+    assert _map_rel_path("/Game/Pack/Maps/Overview") == "pack/maps/overview.vmap"
+    assert _map_rel_path("/Game/Overview") == "overview.vmap"
 
     print("ok")
 

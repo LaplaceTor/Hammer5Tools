@@ -141,6 +141,66 @@ _PACKED_LAYOUTS = {
     "mr":   {"r": "metal", "g": "rough"},
 }
 
+# The names above are not a closed set — across ten UE projects the packed masks
+# also came named ORD, AORM, MRA, ARD, DMAR. Every one of them spells its own
+# channel order, so decode the letters instead of listing the permutations.
+# "s" is specular, which csgo_environment has no slot for, so it drops out.
+_PACKED_LETTER_SLOTS = {"o": "ao", "a": "ao", "r": "rough", "m": "metal",
+                        "d": "height", "h": "height", "s": None}
+
+
+def _decode_packed_name(name: str):
+    """(token, {channel: slot}) for a packed-mask suffix spelled out in capitals
+    ("T_Barrel_01_AORM"), else None.
+
+    Capitals are the guard: the convention is always an upper-case suffix, and
+    without it ordinary words made of the same letters ("Road", "Arm", "Harm")
+    decode as masks.
+    """
+    for run in re.findall(r"[A-Z]{3,5}", str(name)):
+        # "AORM" spells ambient-occlusion as a digraph, so it is three channels,
+        # not four; every other name uses one letter per channel.
+        token = run.lower().replace("ao", "o")
+        if not 3 <= len(token) <= 4 or not set(token) <= set(_PACKED_LETTER_SLOTS):
+            continue
+        slots = [_PACKED_LETTER_SLOTS[c] for c in token]
+        named = [s for s in slots if s]
+        if len(set(named)) < 2:                       # needs to carry real information
+            continue
+        if len(named) != len(set(named)):             # "MRAO": same slot twice, ambiguous
+            continue
+        return token, {channel: slot for channel, slot in zip(CHANNELS, slots) if slot}
+    return None
+
+
+# Textures a material feeds to the GPU that are not surface maps at all: pivot
+# painter position/vector atlases, wind noise, reflection cubemaps, render
+# targets. 620 of them across the corpus, and several carry tokens ("position",
+# "vector", "normals") that otherwise compete for a real slot.
+_NON_SURFACE_TOKENS = {
+    "pivot", "pivotpos", "position", "xvector", "extent", "wind", "turbulence",
+    "gust", "cubemap", "hdri", "rendertarget",
+}
+
+# A secondary map — the detail normal, the dirt overlay, the puddle blend — has
+# the same slot word as the real one ("Detail Normal", "Dirt_Roughness") and no
+# CS2 slot of its own. It may still bind when nothing else does, but it must
+# never outrank the base map.
+_SECONDARY_MAP_TOKENS = {
+    "detail", "det", "dirt", "grunge", "puddle", "snow", "moss", "wear", "cover",
+    "overlay", "secondary", "wet", "wetness", "rain", "blend", "noise", "variation",
+}
+
+
+def is_non_surface_texture(param_name: str, tex_path: str = "") -> bool:
+    """Data textures that must never be bound to a material slot."""
+    toks = _tokens(param_name) | _tokens(os.path.basename(str(tex_path or "")))
+    if toks & _NON_SURFACE_TOKENS:
+        return True
+    squashed = re.sub(r"[^a-z0-9]", "", str(param_name).lower())
+    return any(word in squashed for word in ("rendertarget", "pivotpos", "cubemap"))
+
+
 CHANNELS = ("r", "g", "b", "a")
 
 # Slots a packed channel can legally feed — all single-channel greyscale maps.
@@ -152,22 +212,52 @@ CHANNEL_SLOTS = (
 )
 
 
+def _explicit_channel_layout(param_name: str):
+    """{channel: slot} for a parameter that spells its own channel layout out —
+    "MT(R) R(G) AO(B)", "Cover MT(R) R(G) AO(B)" — else None.
+
+    This is the least ambiguous packed mask there is: the material states the
+    mapping. Without reading it the texture can only feed one slot, and the
+    other two go to whatever secondary map is lying around.
+    """
+    pairs = re.findall(r"([A-Za-z][A-Za-z _]*?)\s*\(\s*([RGBArgba])\s*\)", str(param_name))
+    layout = {}
+    for label, channel in pairs:
+        toks = _tokens(label)
+        for tokens, slot in (
+            (_ROUGH_TOKENS, "rough"), (_METAL_TOKENS | {"mt"}, "metal"),
+            (_AO_TOKENS, "ao"), (_HEIGHT_TOKENS, "height"),
+        ):
+            if toks & tokens:
+                layout.setdefault(channel.lower(), slot)
+                break
+    return layout if len(set(layout.values())) >= 2 else None
+
+
 def packed_layout(param_name: str, tex_path: str = ""):
     """(token, {channel: slot}) if this parameter names a packed mask, else
     (None, None). The texture filename is considered too, since authors often
     name the param "Mask" but the file "Foo_SRM"."""
+    explicit = _explicit_channel_layout(param_name)
+    if explicit:
+        return "explicit", explicit
     toks = _tokens(param_name) | _tokens(os.path.basename(tex_path or ""))
     for key in sorted(_PACKED_LAYOUTS, key=len, reverse=True):
         if key in toks:
             return key, dict(_PACKED_LAYOUTS[key])
+    for name in (param_name, os.path.basename(str(tex_path or ""))):
+        decoded = _decode_packed_name(name)
+        if decoded:
+            return decoded[0], dict(decoded[1])
     return None, None
 
 
 _LAYER2_TOKENS = {"top", "dirt", "moss", "layer2", "2", "l2", "secondary", "overlay"}
 _LAYER3_TOKENS = {"layer3", "3", "l3", "tertiary"}
 
-_COLOR_TOKENS = {"base", "basecolor", "diffuse", "albedo", "color", "diff", "alb", "d", "c", "bc"}
-_NORMAL_TOKENS = {"normal", "nrm", "n", "norm"}
+_COLOR_TOKENS = {"base", "basecolor", "diffuse", "albedo", "color", "diff", "alb", "d", "c", "bc",
+                 "difuse", "basecolour", "billboard"}
+_NORMAL_TOKENS = {"normal", "nrm", "n", "norm", "normalmap", "normals"}
 _ROUGH_TOKENS = {"rough", "roughness", "r"}
 _METAL_TOKENS = {"metal", "metallic", "metalness", "m"}
 _AO_TOKENS = {"ao", "occlusion"}
@@ -208,7 +298,7 @@ _SLOT_TOKENS = [
     ("mask3",    {"mask3", "mask_3"}),
     ("color2",   {"basecolor2", "diffuse2", "albedo2", "color2"}),
     ("color3",   {"basecolor3", "diffuse3", "albedo3", "color3"}),
-    ("emissive", {"emissive", "emmisive", "emission", "emi"}),
+    ("emissive", {"emissive", "emmisive", "emission", "emi", "e", "glow"}),
     ("color",    _COLOR_TOKENS),
 ]
 _COLOR_EXCLUDE = {"var", "variation", "mask", "tint"}
@@ -242,6 +332,14 @@ def _classify_textures(textures: dict, slot_overrides: dict = None, shader: str 
     slot-mapping dialog; these always beat the heuristic.
     """
     if not textures or not isinstance(textures, dict):
+        return {}
+
+    # Pivot-painter atlases, wind noise, reflection cubemaps and render targets
+    # are inputs to a UE shader graph, not surface maps. Dropping them up front
+    # keeps them from winning a slot on a shared word like "position" or
+    # "normals" — and nothing in CS2 could consume them anyway.
+    textures = {p: path for p, path in textures.items() if not is_non_surface_texture(p, path)}
+    if not textures:
         return {}
 
     allowed_slots = set(get_slots_for_shader(shader)) if shader else None
@@ -311,6 +409,11 @@ def _classify_textures(textures: dict, slot_overrides: dict = None, shader: str 
                 has_kind = bool(p_toks & kind_tokens)
                 if not has_kind and slot.startswith("orm"):
                     has_kind = bool(_tokens(os.path.basename(tex_path or "")) & _ORM_TOKENS)
+                    # Base slot only: the layer slots below are chosen by a
+                    # layer word ("top", "layer2"), and csgo_environment has no
+                    # metal2/ao3 to write anyway.
+                    if not has_kind and slot == "orm" and _explicit_channel_layout(param_name):
+                        matching = {"packed"}
 
                 if has_kind:
                     if layer_num == "2" and (p_toks & _LAYER2_TOKENS):
@@ -319,9 +422,22 @@ def _classify_textures(textures: dict, slot_overrides: dict = None, shader: str 
                         matching = {"layer3"}
 
             if matching:
+                # A single letter picked out of the texture filename is not
+                # evidence. "Base Map" bound to T_beach_grass_01_BC_M yields the
+                # token "m", which claimed the metal slot and consumed the
+                # material's base colour. If the parameter's own name says
+                # nothing, one letter from the file cannot claim a slot.
+                own_tokens = _tokens(param_name)
+                if not (matching & own_tokens) and all(len(t) == 1 for t in matching):
+                    continue
                 score = len(matching) * 10 - (len(p_toks) - len(matching))
                 if re.search(r"\b(layer|uv|v|mask|sub)\d*\b", param_name, re.I) and not layer_num:
                     score -= 5
+                # "Detail Normal" and "Dirt_Roughness" name the same slot as the
+                # real map and must lose to it — but still bind if they are all
+                # the material has.
+                if p_toks & _SECONDARY_MAP_TOKENS:
+                    score -= 8
                 candidates.append((score, param_name, tex_path))
         if candidates:
             candidates.sort(key=lambda c: c[0], reverse=True)

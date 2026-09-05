@@ -1207,19 +1207,22 @@ class UnrealPorterWidget(QDialog):
         if not tmp_dir or not os.path.isdir(tmp_dir):
             return list(scope_assets)
 
-        from .asset_selection import asset_stem, classify
-        exported_stems = set()
+        # The cache mirrors the UE package path (<tmp>/Game/KiteDemo/…/SM_Rock.fbx),
+        # so match on it. On the filename alone, one pack's exported SM_Rock made
+        # every other pack's SM_Rock look exported too, and those never ran.
+        from .asset_selection import asset_path_key, classify
+        exported_paths = set()
         for root_path, _, filenames in os.walk(tmp_dir):
+            rel = os.path.relpath(root_path, tmp_dir).replace("\\", "/").strip("./")
             for filename in filenames:
-                stem = os.path.splitext(filename)[0].lower()
-                exported_stems.add(stem)
+                stem = os.path.splitext(filename)[0]
+                exported_paths.add(asset_path_key(f"{rel}/{stem}" if rel else stem))
 
         missing = []
         for key in scope_assets:
             cat = classify(key)
             if cat in ("Models", "Textures"):
-                stem = asset_stem(key)
-                if stem not in exported_stems:
+                if asset_path_key(key) not in exported_paths:
                     missing.append(key)
 
         # The engine roots are never in scope_assets — the scope is a listing of
@@ -1506,8 +1509,10 @@ class UnrealPorterWidget(QDialog):
             self.console.warn("No Master Materials loaded to convert.")
             return False
 
-        from .asset_selection import asset_stem
-        scope = None if (ignore_scope or not self._selected_assets) else {asset_stem(k) for k in self._selected_assets}
+        from .asset_selection import asset_path_key
+        scope = None if (ignore_scope or not self._selected_assets) else {
+            asset_path_key(k) for k in self._selected_assets
+        }
 
         cards = self._master_cards()
         enabled_states = cards.enabled_states() if cards else {}
@@ -1525,7 +1530,10 @@ class UnrealPorterWidget(QDialog):
 
             instances = info.get("instances", [])
             if scope is not None:
-                kept = [inst for inst in instances if str(inst[0]).lower() in scope]
+                # inst = (stem, path, data): scope on the path, or every same-named
+                # material instance in every other pack converts along with the one
+                # that was actually picked.
+                kept = [inst for inst in instances if asset_path_key(inst[1]) in scope]
                 dropped += len(instances) - len(kept)
                 instances = kept
                 if not instances:
