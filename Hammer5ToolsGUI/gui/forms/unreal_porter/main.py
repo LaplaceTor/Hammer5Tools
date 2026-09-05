@@ -74,7 +74,7 @@ class PrepareWorker(CancellableWorker):
             self.log.emit(f"{get_unsupported(key).label}: {len(matched)} asset(s) will be skipped.", "warn")
 
     def run(self):
-        from .ue_export_runner import run_export, UeExportError
+        from .ue_export_runner import run_export, record_export_manifest, UeExportError
 
         try:
             self._report_scope()
@@ -97,6 +97,7 @@ class PrepareWorker(CancellableWorker):
                 self.log.emit(str(e), level)
                 self.done.emit(False)
                 return
+            record_export_manifest(self.tmp_dir, self.assets)
             self.log.emit("UE export finished.", "success")
             self.done.emit(True)
         except Exception as e:  # never let the thread die silently
@@ -1210,20 +1211,25 @@ class UnrealPorterWidget(QDialog):
         # The cache mirrors the UE package path (<tmp>/Game/KiteDemo/…/SM_Rock.fbx),
         # so match on it. On the filename alone, one pack's exported SM_Rock made
         # every other pack's SM_Rock look exported too, and those never ran.
-        from .asset_selection import asset_path_key, classify
+        from .asset_selection import asset_path_key
+        from .ue_export_runner import load_export_manifest
         exported_paths = set()
         for root_path, _, filenames in os.walk(tmp_dir):
             rel = os.path.relpath(root_path, tmp_dir).replace("\\", "/").strip("./")
             for filename in filenames:
                 stem = os.path.splitext(filename)[0]
                 exported_paths.add(asset_path_key(f"{rel}/{stem}" if rel else stem))
+        exported_paths |= load_export_manifest(tmp_dir)
 
-        missing = []
-        for key in scope_assets:
-            cat = classify(key)
-            if cat in ("Models", "Textures"):
-                if asset_path_key(key) not in exported_paths:
-                    missing.append(key)
+        # Every asset in scope is offered to the Editor once, except maps, which
+        # the bridge reads straight from the project. Filtering by the category
+        # guessed from an asset's name is what hid whole packs of meshes: only
+        # "SM_"-prefixed or Meshes/-foldered assets were ever queued.
+        missing = [
+            key for key in scope_assets
+            if not str(key).lower().endswith(".umap")
+            and asset_path_key(key) not in exported_paths
+        ]
 
         # The engine roots are never in scope_assets — the scope is a listing of
         # the project — so nothing above can ask for them. They export whenever

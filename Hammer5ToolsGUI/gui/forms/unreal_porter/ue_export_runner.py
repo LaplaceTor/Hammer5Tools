@@ -28,6 +28,46 @@ class UeExportError(RuntimeError):
     pass
 
 
+# Written into the export cache: one asset path key per line, for every asset
+# the Editor has been asked to export.
+EXPORT_MANIFEST = "exported_assets.txt"
+
+
+def load_export_manifest(tmp_dir: str) -> set:
+    """The asset path keys the Editor has already been asked for.
+
+    Files alone cannot say whether the cache is complete. Plenty of assets
+    produce no file however often they are exported (curves, data assets,
+    material functions), and the old check papered over that by only ever asking
+    about assets whose *name* looked like a mesh or a texture — so a project's
+    "BogMyrtleBush_01" in an Environments/Foliage folder was never queued at
+    all, and every map that placed it got a vmdl pointing at an FBX nobody
+    wrote. Recording what was asked for is the only answer that does not depend
+    on guessing an asset's type from its name.
+    """
+    path = os.path.join(tmp_dir or "", EXPORT_MANIFEST)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return {line.strip() for line in handle if line.strip()}
+    except OSError:
+        return set()
+
+
+def record_export_manifest(tmp_dir: str, keys) -> None:
+    """Add these assets to the manifest — asked for, so never asked again."""
+    from .asset_selection import asset_path_key
+
+    if not tmp_dir or not keys:
+        return
+    known = load_export_manifest(tmp_dir) | {asset_path_key(k) for k in keys}
+    try:
+        os.makedirs(tmp_dir, exist_ok=True)
+        with open(os.path.join(tmp_dir, EXPORT_MANIFEST), "w", encoding="utf-8") as handle:
+            handle.write("\n".join(sorted(known)) + "\n")
+    except OSError:
+        pass    # A cache that cannot be written still converts; it just re-exports.
+
+
 def find_uproject(project_content_dir: str) -> str:
     """The .uproject file sits one folder up from the project's Content dir."""
     project_root = os.path.dirname(os.path.normpath(project_content_dir))
@@ -184,6 +224,22 @@ def demo():
         editor_exe_ue4 = os.path.join(editor_dir_ue4, "UE4Editor-Cmd.exe")
         open(editor_exe_ue4, "w").close()
         assert find_editor_cmd(os.path.join(tmp, "UE_4.27")) == editor_exe_ue4
+
+        # The manifest is what stops the cache check from having to guess an
+        # asset's type from its name. An asset that was asked for counts as done
+        # whether or not the Editor could write a file for it — a curve never
+        # produces one — and it is keyed by path, so two packs' same-named
+        # assets are tracked separately.
+        cache = os.path.join(tmp, "cache")
+        assert load_export_manifest(cache) == set()
+        record_export_manifest(cache, ["KiteDemo/Meshes/SM_Rock.uasset",
+                                       "Poplar/Meshes/SM_Rock.uasset"])
+        assert load_export_manifest(cache) == {"kitedemo/meshes/sm_rock", "poplar/meshes/sm_rock"}
+        # Recording again adds to the manifest rather than replacing it.
+        record_export_manifest(cache, ["KiteDemo/Curves/ChromaticCurve.uasset"])
+        assert load_export_manifest(cache) == {
+            "kitedemo/meshes/sm_rock", "poplar/meshes/sm_rock", "kitedemo/curves/chromaticcurve",
+        }
 
     print("ok")
 
