@@ -119,6 +119,40 @@ class UnrealBridge:
     def dump(self, object_path: str) -> Any:
         return self._call("unreal_dump", object_path)
 
+    def dump_mesh(self, mesh_path: str) -> dict:
+        """A static mesh's authored settings, or {} if the asset holds no mesh.
+
+        The material slots are the reason this exists: UE records slot name ->
+        material asset, which is the exact answer the vmdl material remap
+        otherwise reconstructs by stripping prefixes off FBX material names and
+        fuzzy-matching them against whatever vmats happen to be on disk.
+        """
+        try:
+            exports = self.dump(mesh_path)
+        except BridgeError:
+            return {}
+        mesh = next((e for e in (exports or []) if e.get("class") == "StaticMesh"), None)
+        if not mesh:
+            return {}
+        props = mesh.get("properties") or {}
+        body = next((e for e in exports if e.get("class") == "BodySetup"), None)
+        hulls = (((body or {}).get("properties") or {}).get("AggGeom") or {}).get("ConvexElems") or []
+        slots = []
+        for slot in props.get("StaticMaterials") or []:
+            if isinstance(slot, dict):
+                slots.append({
+                    "name": slot.get("MaterialSlotName") or slot.get("ImportedMaterialSlotName") or "",
+                    "material": slot.get("MaterialInterface") or "",
+                })
+        return {
+            "slots": slots,
+            "lods": len(props.get("SourceModels") or []),
+            "lod_group": props.get("LODGroup") or "",
+            "lightmap_resolution": props.get("LightMapResolution"),
+            "lightmap_uv_index": props.get("LightMapCoordinateIndex"),
+            "collision_hulls": len(hulls),
+        }
+
     def iter_refs(self, object_path: str, timeout: int = 600, is_cancelled=None) -> set:
         """Every object reference in an asset.
 

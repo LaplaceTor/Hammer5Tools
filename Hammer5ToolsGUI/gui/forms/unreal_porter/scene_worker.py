@@ -515,6 +515,15 @@ class SceneModelsWorker(CancellableWorker):
                     made += 1
                     continue
 
+                # UE's own slot table beats reconstructing the mapping from FBX
+                # material names: it says which material is in which slot.
+                ue_materials = None
+                try:
+                    info = self.bridge.dump_mesh(_object_path_to_key(mesh))
+                    ue_materials = [s["material"] for s in info.get("slots", [])] or None
+                except BridgeError:
+                    pass
+
                 mesh_rel = os.path.splitext(model_rel)[0] + ".fbx"      # models/.../x.fbx
                 src_fbx = find_bulk_export_mesh(self.bulk_dir, mesh) if self.bulk_dir else None
                 dst_fbx = None
@@ -539,6 +548,7 @@ class SceneModelsWorker(CancellableWorker):
                 # Inspect the copied FBX (or the source) to build LODs + physics.
                 self._write_vmdl(vmdl_path, mesh_rel, import_scale=self.unit_scale,
                            fbx_path=dst_fbx or src_fbx, material_path=mat_rel, output_dir=self.output_dir,
+                           ue_materials=ue_materials,
                            use_graybox_fallback=self.use_graybox_fallback)
                 made += 1
 

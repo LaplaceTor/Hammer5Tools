@@ -37,7 +37,7 @@ _DEFAULT_SIMPLIFY = {
 # of them go — including stacked ones like "SM_MI_Foo".
 _UE_PREFIXES = (
     "SM", "SKM", "SK",                              # meshes
-    "M", "MI", "MID", "MM", "MF", "MPC",            # materials
+    "M", "MI", "MID", "MM", "MF", "MPC", "ML",      # materials
     "T", "TX", "TEX", "RT",                         # textures
     "BP", "BPI", "ABP", "WBP",                      # blueprints
     "UCX", "UBX", "USP", "UCP", "PHYS", "PA",       # collision / physics
@@ -45,6 +45,9 @@ _UE_PREFIXES = (
     "AM", "AS", "BS", "ANIM",                       # animation
     "SW", "SC", "MS", "CUE", "SFX",                 # audio
     "DA", "DT", "CRV",                              # data
+    # Seen across ten marketplace projects: foliage texture / static-mesh
+    # foliage / lighting-group prefixes, ~300 assets that kept their type tag.
+    "FT", "SMF", "LGT",
 )
 # Single letters beyond M_/T_ (A_, S_, E_, L_) are deliberately absent: they eat
 # real words ("SM_A_Frame" -> "frame") for prefixes barely anyone uses.
@@ -301,7 +304,8 @@ def _is_real_vmat(filepath: str) -> bool:
         return False
 
 
-def resolve_material_remaps(fbx_path: str = None, output_dir: str = None, model_rel_path: str = None, default_mat_path: str = None) -> list:
+def resolve_material_remaps(fbx_path: str = None, output_dir: str = None, model_rel_path: str = None,
+                            default_mat_path: str = None, ue_materials=None) -> list:
     """
     Inspects fbx_path for embedded FBX material names (e.g. 'mi_rock_3').
     Strips mi_, m_, mm_, t_ prefixes to find material stems.
@@ -333,6 +337,22 @@ def resolve_material_remaps(fbx_path: str = None, output_dir: str = None, model_
                             if st not in vmat_lookup or q > vmat_quality.get(st, 0):
                                 vmat_lookup[st] = rel_p
                                 vmat_quality[st] = q
+
+    # UE records which material sits in which slot. When the mesh asset was read,
+    # that is the answer — the FBX exports its slots in the same order, so the
+    # i-th embedded material is the i-th UE slot. Everything below this is the
+    # fallback for when the mesh could not be read: strip the prefixes off the
+    # FBX material name and hope a matching vmat is on disk.
+    if embedded_mats and ue_materials and len(ue_materials) == len(embedded_mats):
+        from .material_converter import ue_material_to_vmat_path
+        for raw_mat, ue_material in zip(embedded_mats, ue_materials):
+            if not ue_material:
+                continue
+            from_name = raw_mat if raw_mat.lower().endswith(".vmat") else f"{raw_mat}.vmat"
+            remaps.append({"from": from_name, "to": ue_material_to_vmat_path(ue_material)})
+        if len(remaps) == len(embedded_mats):
+            return remaps
+        remaps = []
 
     if embedded_mats:
         for raw_mat in embedded_mats:
@@ -577,6 +597,7 @@ def write_vmdl(output_path: str, mesh_rel_path: str,
                import_lods: bool = True,
                import_collision: bool = True,
                strip_prefix: bool = True,
+               ue_materials=None,
                mirror_axes=None,
                scale_apply_mode: str = "FBX",
                processed_files: set = None) -> str:
@@ -639,7 +660,8 @@ def write_vmdl(output_path: str, mesh_rel_path: str,
             fbx_path=fbx_path,
             output_dir=output_dir,
             model_rel_path=mesh_rel_path,
-            default_mat_path=material_path
+            default_mat_path=material_path,
+            ue_materials=ue_materials,
         )
         if output_dir and material_remaps:
             from .vmat_writer import write_vmat
