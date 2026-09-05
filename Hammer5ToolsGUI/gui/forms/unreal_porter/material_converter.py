@@ -157,11 +157,15 @@ def _decode_packed_name(name: str):
     without it ordinary words made of the same letters ("Road", "Arm", "Harm")
     decode as masks.
     """
-    for run in re.findall(r"[A-Z]{3,5}", str(name)):
+    for run in re.findall(r"[A-Z]{2,5}", str(name)):
         # "AORM" spells ambient-occlusion as a digraph, so it is three channels,
         # not four; every other name uses one letter per channel.
         token = run.lower().replace("ao", "o")
-        if not 3 <= len(token) <= 4 or not set(token) <= set(_PACKED_LETTER_SLOTS):
+        # Two letters are only convincing when they are the whole parameter name
+        # ("DR" bound to T_..._DpR); inside a longer name they are noise.
+        if len(token) < 3 and run != str(name).strip():
+            continue
+        if not 2 <= len(token) <= 4 or not set(token) <= set(_PACKED_LETTER_SLOTS):
             continue
         slots = [_PACKED_LETTER_SLOTS[c] for c in token]
         named = [s for s in slots if s]
@@ -412,7 +416,7 @@ def _classify_textures(textures: dict, slot_overrides: dict = None, shader: str 
                     # Base slot only: the layer slots below are chosen by a
                     # layer word ("top", "layer2"), and csgo_environment has no
                     # metal2/ao3 to write anyway.
-                    if not has_kind and slot == "orm" and _explicit_channel_layout(param_name):
+                    if not has_kind and slot == "orm" and packed_layout(param_name, tex_path)[0]:
                         matching = {"packed"}
 
                 if has_kind:
