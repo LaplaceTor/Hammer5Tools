@@ -41,6 +41,47 @@ def kill_process(process_name: str) -> None:
     )
 
 
+def kill_processes() -> None:
+    """Kills running Hammer5Tools instances, including Python dev GUI processes."""
+    for p in ["Hammer5Tools.exe", "fileedit.exe"]:
+        kill_process(p)
+
+    try:
+        import psutil
+        current_pid = os.getpid()
+        normalized_cur_dir = os.path.normcase(os.path.abspath(cur_dir))
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            if proc.info['pid'] == current_pid:
+                continue
+            name = (proc.info.get('name') or '').lower()
+            if 'python' not in name and 'hammer5tools' not in name:
+                continue
+            try:
+                cmdline = [str(arg).lower() for arg in (proc.info.get('cmdline') or [])]
+                is_h5t_gui = any('hammer5toolsgui' in arg for arg in cmdline) and any(
+                    arg.endswith('.py') or 'main' in arg for arg in cmdline
+                )
+
+                has_locked_dll = False
+                if not is_h5t_gui:
+                    for m in proc.memory_maps():
+                        if m.path:
+                            norm_path = os.path.normcase(os.path.abspath(m.path))
+                            if 'hammer5tools.core.dll' in norm_path and normalized_cur_dir in norm_path:
+                                has_locked_dll = True
+                                break
+
+                if is_h5t_gui or has_locked_dll:
+                    print(f"Terminating running Hammer5Tools process (PID {proc.pid})...")
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                continue
+    except Exception:
+        pass
+
+
+
 def find_pycparser_tables():
     """
     Return (lextab_path, yacctab_path) if the pre-generated pycparser parser
@@ -151,7 +192,24 @@ def build_libraries() -> None:
     """Builds and publishes the Hammer5Tools.Core native AOT library."""
     core_project = os.path.join(core_csharp_root, 'Hammer5Tools.Core', 'Hammer5Tools.Core.csproj')
     core_publish = os.path.join(core_csharp_root, 'Hammer5Tools.Core', 'publish')
+    core_publish_dll = os.path.join(core_publish, 'Hammer5Tools.Core.dll')
     native_aot_output = os.path.join(build_root, 'native-aot')
+
+    if os.path.exists(core_publish_dll):
+        try:
+            with open(core_publish_dll, 'r+b'):
+                pass
+        except PermissionError:
+            kill_processes()
+            try:
+                with open(core_publish_dll, 'r+b'):
+                    pass
+            except PermissionError as e:
+                raise RuntimeError(
+                    f"Cannot build Hammer5Tools.Core: '{core_publish_dll}' is locked by another process. "
+                    "Please close all running instances of Hammer5Tools and try again."
+                ) from e
+
     if os.path.exists(core_project):
         print("Building Hammer5Tools.Core (win-x64 NativeAOT)...")
         subprocess.run([
@@ -164,6 +222,7 @@ def build_libraries() -> None:
             # Link in disposable build staging so that lock cannot break packaging.
             f'-p:BaseOutputPath={native_aot_output}{os.sep}',
         ], check=True)
+
 
 
 def build_app_pyinstaller(fast=False, channel='stable') -> None:
@@ -501,11 +560,7 @@ def main() -> None:
 
     stage_start_time = time.time()
     # Kill processes
-    for p in ["Hammer5Tools.exe", "fileedit.exe"]:
-        kill_process(p)
-
-
-
+    kill_processes()
     print_elapsed_time("Kill processes", stage_start_time)
 
     results = []
