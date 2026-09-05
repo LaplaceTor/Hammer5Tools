@@ -126,8 +126,63 @@ static class UnrealBridgeProgram
     internal static string Dump(DefaultFileProvider provider, string objectPath)
     {
         var pkg = provider.LoadPackage(objectPath);
-        var exports = pkg.GetExports();
-        return JsonConvert.SerializeObject(exports, Formatting.Indented);
+        var result = new List<Dictionary<string, object?>>();
+        foreach (var export in pkg.GetExports())
+        {
+            var properties = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var tag in export.Properties)
+                properties[tag.Name.Text] = SimplifyTag(tag.Tag, 0);
+            result.Add(new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["name"] = export.Name,
+                ["class"] = export.ExportType,
+                ["properties"] = properties,
+            });
+        }
+        return JsonConvert.SerializeObject(result, Formatting.Indented);
+    }
+
+    // Serializing a UObject outright goes through CUE4Parse's UObjectConverter,
+    // whose reflection is not available under NativeAOT — the call threw
+    // "Error creating 'CUE4Parse.UObjectConverter'" for every asset, which read
+    // as "this asset cannot be parsed" when in fact it parses fine and only the
+    // JSON conversion failed. Walking the tagged properties keeps everything a
+    // caller actually needs (a mesh's material slots, its Nanite and lightmap
+    // settings, an actor's transform) and stays AOT-safe.
+    private static object? SimplifyTag(FPropertyTagType? tag, int depth)
+    {
+        if (tag == null || depth > 6) return null;
+        switch (tag)
+        {
+            case ObjectProperty obj:
+                return PkgIndexPath(obj.Value);
+            case StructProperty st when st.Value?.StructType is FStructFallback fallback:
+                return SimplifyProperties(fallback.Properties, depth + 1);
+            case ArrayProperty arr when arr.Value != null:
+                return arr.Value.Properties.Select(item => SimplifyTag(item, depth + 1)).ToList();
+            case BoolProperty b:
+                return b.Value;
+            case IntProperty i:
+                return i.Value;
+            case FloatProperty f:
+                return f.Value;
+            case NameProperty n:
+                return n.Value.Text;
+            case StrProperty s:
+                return s.Value;
+            default:
+                // Enums and byte properties surface as FName; everything else is
+                // reported as text rather than dropped, so a caller can still see it.
+                return tag.GenericValue?.ToString();
+        }
+    }
+
+    private static Dictionary<string, object?> SimplifyProperties(List<FPropertyTag> properties, int depth)
+    {
+        var simplified = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var tag in properties ?? [])
+            simplified[tag.Name.Text] = SimplifyTag(tag.Tag, depth);
+        return simplified;
     }
 
     // Every asset reference in a package, as a flat list of object paths.
@@ -982,6 +1037,27 @@ static class UnrealBridgeProgram
                         var tex = ex.GetOrDefault<FPackageIndex?>("Texture", null)?.ResolvedObject?.GetPathName();
                         if (!string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(tex) && !textures.ContainsKey(name))
                             textures[name] = tex;
+                        break;
+                    }
+                case "MaterialExpressionTextureSample":
+                    {
+                        // A texture wired straight into a graph pin exposes no
+                        // ParameterName, so it was dropped entirely — which is why
+                        // base materials that parameterise nothing (M_1Meter_01,
+                        // M_CycRoom_01, M_DeadLeaves) reported zero textures and
+                        // their vmats fell back to default_color.tga. The texture's
+                        // own asset name is the only identity it has, and the slot
+                        // matcher already reads texture filenames, so "T_Grid_01_D"
+                        // still lands on the colour slot.
+                        var sampled = ex.GetOrDefault<FPackageIndex?>("Texture", null)?.ResolvedObject?.GetPathName();
+                        if (!string.IsNullOrEmpty(sampled))
+                        {
+                            var key = sampled[(sampled.LastIndexOf('/') + 1)..];
+                            var dot = key.IndexOf('.');
+                            if (dot >= 0) key = key[..dot];
+                            if (key.Length > 0 && !textures.ContainsKey(key))
+                                textures[key] = sampled;
+                        }
                         break;
                     }
                 case "MaterialExpressionScalarParameter":
