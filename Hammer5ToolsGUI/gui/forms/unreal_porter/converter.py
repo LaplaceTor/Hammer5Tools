@@ -272,6 +272,10 @@ def seed_shader_for(master_name: str, mat_flags: dict = None) -> str:
         return "csgo_static_overlay.vfx"
     if shading == "MSM_TwoSidedFoliage" or (blend == "BLEND_Masked" and shading == "MSM_Subsurface"):
         return "csgo_foliage.vfx"
+    # Water and thin translucency are opaque-blend-mode materials that are not
+    # opaque; only the shading model says so.
+    if shading in ("MSM_SingleLayerWater", "MSM_ThinTranslucent"):
+        return "csgo_glass.vfx"
     if blend in _TRANSLUCENT_BLENDS:
         # Unlit translucency is a glow card, beam or particle sheet; lit
         # translucency is glass. Additive is never glass.
