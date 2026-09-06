@@ -311,7 +311,7 @@ def get_master_material_name(mat_data: dict, mat_key: str = "") -> str:
 
 def save_material_swaps_kv3(output_dir: str, swaps: dict, slot_mappings: dict = None,
                             param_mappings: dict = None, feature_flags: dict = None,
-                            blend_modes: dict = None):
+                            blend_modes: dict = None, auto_seed: dict = None):
     """Saves Master Material -> CS2 Shader swaps, slot mappings, param
     mappings, feature flags, and blend modes into hammer5tools/unrealporter/shader_swap.kv3 in output_dir."""
     if not output_dir or not os.path.isdir(output_dir):
@@ -327,6 +327,18 @@ def save_material_swaps_kv3(output_dir: str, swaps: dict, slot_mappings: dict = 
     for master_name, shader_name in sorted(swaps.items()):
         lines.append(f'\t\t"{master_name}" = "{shader_name}"')
     lines.append("\t}")
+
+    # What the seeder produced, so a later run can tell its own guess from a
+    # choice the user made. Callers that only rewrite the shader table (the
+    # convert path) pass nothing, and the section on disk is carried over.
+    if auto_seed is None:
+        auto_seed = load_material_swaps_kv3(output_dir)[5]
+    if auto_seed:
+        lines.append("\tmaster_material_auto_seed = ")
+        lines.append("\t{")
+        for master_name, shader_name in sorted(auto_seed.items()):
+            lines.append(f'\t\t"{master_name}" = "{shader_name}"')
+        lines.append("\t}")
 
     import json
     if slot_mappings:
@@ -397,15 +409,16 @@ def load_material_swaps_kv3(output_dir: str) -> tuple:
     Returns: (swaps_dict, slot_mappings_dict, param_mappings_dict, feature_flags_dict, blend_modes_dict)
     """
     swaps, slot_mappings, param_mappings, feature_flags, blend_modes = {}, {}, {}, {}, {}
+    auto_seed = {}
     if not output_dir:
-        return swaps, slot_mappings, param_mappings, feature_flags, blend_modes
+        return swaps, slot_mappings, param_mappings, feature_flags, blend_modes, auto_seed
     file_path = os.path.join(output_dir, "hammer5tools", "unrealporter", "shader_swap.kv3")
     if not os.path.isfile(file_path):
         legacy_path = os.path.join(output_dir, "hammer5tools_ue_converter_material_swaps.kv3")
         if os.path.isfile(legacy_path):
             file_path = legacy_path
         else:
-            return swaps, slot_mappings, param_mappings, feature_flags, blend_modes
+            return swaps, slot_mappings, param_mappings, feature_flags, blend_modes, auto_seed
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -431,11 +444,14 @@ def load_material_swaps_kv3(output_dir: str) -> tuple:
             elif "master_material_blend_modes" in line_s:
                 section = "blend_modes"
                 continue
+            elif "master_material_auto_seed" in line_s:
+                section = "auto_seed"
+                continue
 
-            if section == "shaders":
+            if section in ("shaders", "auto_seed"):
                 m = re.search(r'"([^"]+)"\s*=\s*"([^"]+)"', line_s)
                 if m:
-                    swaps[m.group(1)] = m.group(2)
+                    (swaps if section == "shaders" else auto_seed)[m.group(1)] = m.group(2)
             elif section == "blend_modes":
                 m = re.search(r'"([^"]+)"\s*=\s*(\d+)', line_s)
                 if m:
@@ -482,7 +498,7 @@ def load_material_swaps_kv3(output_dir: str) -> tuple:
                         target[current_master][param_name] = parsed_val
     except Exception:
         pass
-    return swaps, slot_mappings, param_mappings, feature_flags, blend_modes
+    return swaps, slot_mappings, param_mappings, feature_flags, blend_modes, auto_seed
 
 
 def apply_saved_swaps(groups: dict, output_dir: str) -> dict:
@@ -500,9 +516,15 @@ def apply_saved_swaps(groups: dict, output_dir: str) -> dict:
     saved_swaps, saved_slot_mappings, saved_param_mappings = res[0], res[1], res[2]
     saved_feature_flags = res[3] if len(res) > 3 else {}
     saved_blend_modes = res[4] if len(res) > 4 else {}
+    saved_auto_seed = res[5] if len(res) > 5 else {}
 
     for name, info in groups.items():
-        if saved_swaps.get(name):
+        # A saved shader that still matches what the seeder produced for it was
+        # never chosen by anyone — it is last run's automatic guess, and holding
+        # on to it means an improved seeder can never correct itself. Foliage
+        # kept converting as csgo_environment for exactly this reason. A saved
+        # value that differs is the user's pick in the Materials tab, and wins.
+        if saved_swaps.get(name) and saved_swaps[name] != saved_auto_seed.get(name):
             info["shader"] = saved_swaps[name]
         if saved_slot_mappings.get(name):
             info["slot_overrides"] = saved_slot_mappings[name]
@@ -531,6 +553,10 @@ def scan_master_materials(project_dir: str, bulk_dir: str = None, bridge=None, o
         saved_swaps, saved_slot_mappings, saved_param_mappings = res[0], res[1], res[2]
         saved_feature_flags = res[3] if len(res) > 3 else {}
         saved_blend_modes = res[4] if len(res) > 4 else {}
+        saved_auto_seed = res[5] if len(res) > 5 else {}
+        # Same rule as apply_saved_swaps: an entry still equal to the seeder's
+        # own last guess is not a decision, so it is re-seeded rather than kept.
+        saved_swaps = {n: v for n, v in saved_swaps.items() if v != saved_auto_seed.get(n)}
     else:
         saved_swaps, saved_slot_mappings, saved_param_mappings = {}, {}, {}
         saved_feature_flags, saved_blend_modes = {}, {}
@@ -659,6 +685,7 @@ def scan_master_materials(project_dir: str, bulk_dir: str = None, bridge=None, o
             param_mappings={n: i.get("param_overrides") or {} for n, i in groups.items()},
             feature_flags={n: i.get("feature_flags") or {} for n, i in groups.items()},
             blend_modes={n: i.get("blend_mode") or 0 for n, i in groups.items()},
+            auto_seed={name: info["shader"] for name, info in groups.items()},
         )
     if log_cb:
         if seeded:

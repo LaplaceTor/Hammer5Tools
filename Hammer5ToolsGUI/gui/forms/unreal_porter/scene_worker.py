@@ -631,7 +631,8 @@ class SceneModelsWorker(CancellableWorker):
             seed_shader_for, save_material_swaps_kv3,
         )
 
-        kv3_swaps, kv3_slots, kv3_params, kv3_flags, kv3_blend = load_material_swaps_kv3(self.output_dir)
+        (kv3_swaps, kv3_slots, kv3_params, kv3_flags, kv3_blend,
+         kv3_auto_seed) = load_material_swaps_kv3(self.output_dir)
         merged_shaders = dict(kv3_swaps)
         if self.master_shaders:
             merged_shaders.update(self.master_shaders)
@@ -654,11 +655,15 @@ class SceneModelsWorker(CancellableWorker):
                 if not shader:
                     shader = seed_shader_for(master_name, data.get("flags"))
                     merged_shaders[master_name] = shader
+                    # Record that this one was seeded, not chosen, so a later
+                    # scan may improve on it instead of treating it as a pick.
+                    kv3_auto_seed[master_name] = shader
                     save_material_swaps_kv3(self.output_dir, merged_shaders,
                                             slot_mappings=self.master_slot_overrides or kv3_slots,
                                             param_mappings=self.master_param_overrides or kv3_params,
                                             feature_flags=self.master_feature_flags or kv3_flags,
-                                            blend_modes=self.master_blend_modes or kv3_blend)
+                                            blend_modes=self.master_blend_modes or kv3_blend,
+                                            auto_seed=kv3_auto_seed)
                     source = f"stamped & mapped {master_name}"
                 else:
                     source = f"remap of {master_name}"
