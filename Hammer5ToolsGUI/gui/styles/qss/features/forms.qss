@@ -243,17 +243,17 @@ QLabel[h5Component="updaterNoteLabel"] {
    shape and metrics; amber background with wider side padding. */
 QPushButton[h5Component="updateButton"] {
     background-color: @warning;
-    color: #ffffff;
+    color: @hex_ffffff;
     padding-left: 14px;
     padding-right: 14px;
 }
 QPushButton[h5Component="updateButton"]:hover {
     background-color: @hex_f0b02a;
-    color: #ffffff;
+    color: @hex_ffffff;
 }
 QPushButton[h5Component="updateButton"]:pressed {
     background-color: @hex_c9880a;
-    color: #ffffff;
+    color: @hex_ffffff;
 }
 
 /* widgets/common.py: ErrorInfo dialog's details box. border-color varies
