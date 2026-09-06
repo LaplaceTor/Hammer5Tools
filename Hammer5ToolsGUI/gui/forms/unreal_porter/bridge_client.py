@@ -144,6 +144,14 @@ class UnrealBridge:
                     "name": slot.get("MaterialSlotName") or slot.get("ImportedMaterialSlotName") or "",
                     "material": slot.get("MaterialInterface") or "",
                 })
+        if not slots:
+            # UE4-era assets predate named slots and store a plain array of
+            # material paths in "Materials" instead. Most of a marketplace
+            # project is these, and reading only StaticMaterials returned no
+            # slots for them at all — silently falling back to guessing.
+            for material in props.get("Materials") or []:
+                if isinstance(material, str) and material:
+                    slots.append({"name": "", "material": material})
         return {
             "slots": slots,
             "lods": len(props.get("SourceModels") or []),
